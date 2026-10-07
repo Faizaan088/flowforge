@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: flowforge_user
+      POSTGRES_PASSWORD: flowforge_password
+      POSTGRES_DB: flowforge
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    
+
+  api:
+    build: .
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+      # - "8080:8080" # old port
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://flowforge_user:flowforge_password@postgres:5432/flowforge
+      - REDIS_URL=redis://redis:6379/0
+
+  worker:
+    build: .
+    command: python -u worker.py
+    volumes:
+      - .:/app
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://flowforge_user:flowforge_password@postgres:5432/flowforge
+      - REDIS_URL=redis://redis:6379/0
+
+volumes:
+  postgres_data:
