@@ -5,14 +5,13 @@ from typing import Optional, Dict, Any
 import os
 import redis
 from redis.exceptions import RedisError
-from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import and_
 
 from database import engine, Base, get_db, AsyncSessionLocal
 import models 
+from execution_recovery import recover_expired_executions
 from queue_reconciliation import enqueue_execution, reconcile_queued_executions
 
 class JobCreate(BaseModel):
@@ -100,35 +99,13 @@ async def reconcile_execution_queue(db: AsyncSession = Depends(get_db)):
 
 @app.post("/system/sweep")
 async def sweep_dead_jobs(db: AsyncSession = Depends(get_db)):
-    print("Sweeper running: Looking for dead workers...")
-    now = datetime.now(timezone.utc)
-    
-    result = await db.execute(
-        select(models.Execution).where(
-            and_(
-                models.Execution.status == "RUNNING",
-                models.Execution.lease_until < now
-            )
-        )
-    )
-    dead_executions = result.scalars().all()
-    
-    if not dead_executions:
+    recovered_ids = await recover_expired_executions(db)
+    if not recovered_ids:
         return {"message": "All clean! No dead jobs found."}
-        
-    r_url = os.getenv("REDIS_URL")
-    redis_client = redis.from_url(r_url, decode_responses=True)
-    
-    swept_ids = []
-    for exec in dead_executions:
-        print(f"Found dead execution {exec.id}! Re-queuing...")
-        exec.status = "QUEUED"
-        exec.worker_id = None
-        exec.lease_until = None
-        exec.attempt += 1
-        
-        redis_client.lpush("flowforge:queue", exec.id)
-        swept_ids.append(exec.id)
-        
-    await db.commit()
-    return {"message": f"Swept and recovered {len(swept_ids)} jobs", "recovered_ids": swept_ids}
+
+    reconciliation = await reconcile_queue(db)
+    return {
+        "message": f"Swept and recovered {len(recovered_ids)} jobs",
+        "recovered_ids": recovered_ids,
+        "reconciliation": reconciliation.as_dict() if reconciliation else None,
+    }
