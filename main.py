@@ -1,9 +1,10 @@
 from fastapi import FastAPI, Depends, HTTPException
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import os
 import redis
+import asyncio
 from redis.exceptions import RedisError
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +14,11 @@ from database import engine, Base, get_db, AsyncSessionLocal
 import models 
 from execution_recovery import recover_expired_executions
 from queue_reconciliation import enqueue_execution, reconcile_queued_executions
+
+
+RECOVERY_INTERVAL_SECONDS = float(
+    os.getenv("EXECUTION_RECOVERY_INTERVAL_SECONDS", "10")
+)
 
 class JobCreate(BaseModel):
     name: str
@@ -28,8 +34,14 @@ async def lifespan(app: FastAPI):
         reconciliation = await reconcile_queue(session)
         if reconciliation is not None:
             print(f"Startup queue reconciliation: {reconciliation.as_dict()}")
-    yield
-    print("SHUTTING DOWN...")
+    recovery_task = asyncio.create_task(recovery_loop())
+    try:
+        yield
+    finally:
+        recovery_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await recovery_task
+        print("SHUTTING DOWN...")
 
 app = FastAPI(title="FlowForge API", version="0.1.0", lifespan=lifespan)
 
@@ -42,6 +54,28 @@ async def reconcile_queue(db: AsyncSession):
 
     redis_client = redis.from_url(r_url, decode_responses=True)
     return await reconcile_queued_executions(db, redis_client)
+
+
+async def run_recovery_cycle():
+    async with AsyncSessionLocal() as session:
+        recovered_ids = await recover_expired_executions(session)
+        reconciliation = None
+        if recovered_ids:
+            reconciliation = await reconcile_queue(session)
+    return recovered_ids, reconciliation
+
+
+async def recovery_loop(interval_seconds: float = RECOVERY_INTERVAL_SECONDS):
+    while True:
+        try:
+            recovered_ids, reconciliation = await run_recovery_cycle()
+            if recovered_ids:
+                print(f"Recovered expired executions: {recovered_ids}")
+            if reconciliation is not None and reconciliation.redis_error:
+                print(f"Queue reconciliation failed: {reconciliation.redis_error}")
+        except Exception as error:
+            print(f"Execution recovery cycle failed: {error}")
+        await asyncio.sleep(interval_seconds)
 
 @app.get("/health")
 async def health_check():
