@@ -10,6 +10,7 @@ class JobDefinition(Base):
     
     payload = Column(JSON, nullable=True) 
     priority = Column(Integer, default=0)
+    max_retries = Column(Integer, default=3, nullable=False)
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -19,12 +20,14 @@ class Execution(Base):
     id = Column(Integer, primary_key=True, index=True)
     job_definition_id = Column(Integer, ForeignKey("job_definitions.id"))
     
-    # QUEUED, CLAIMED, RUNNING, SUCCEEDED, FAILED, DEAD_LETTERED
+    # QUEUED, CLAIMED, RUNNING, SUCCEEDED, FAILED, RETRY_WAIT, DEAD_LETTERED
     status = Column(String, default="QUEUED", index=True) 
     attempt = Column(Integer, default=0)
+    max_retries = Column(Integer, default=3, nullable=False)
     
     worker_id = Column(String, nullable=True)
     lease_until = Column(DateTime(timezone=True), nullable=True)
+    available_at = Column(DateTime(timezone=True), nullable=True)
     
     started_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)

@@ -104,3 +104,29 @@ async def complete_execution(
             .returning(Execution.id)
         )
         return result.scalar_one_or_none() is not None
+
+
+async def fail_execution(
+    session: AsyncSession,
+    claim: ExecutionClaim,
+    error_summary: str | None = None,
+) -> bool:
+    """Mark an execution failed only when the original claim still owns it."""
+    async with session.begin():
+        result = await session.execute(
+            update(Execution)
+            .where(
+                Execution.id == claim.execution_id,
+                Execution.status == "RUNNING",
+                Execution.worker_id == claim.worker_id,
+                Execution.lease_until == claim.lease_until,
+            )
+            .values(
+                status="FAILED",
+                lease_until=None,
+                finished_at=datetime.now(timezone.utc),
+                error_summary=error_summary,
+            )
+            .returning(Execution.id)
+        )
+        return result.scalar_one_or_none() is not None
