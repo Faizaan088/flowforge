@@ -23,8 +23,25 @@ if TEST_DATABASE_URL:
 
     import main  # noqa: E402
     from database import Base  # noqa: E402
-    from models import Execution  # noqa: E402
+    from execution_claim import (  # noqa: E402
+        claim_execution,
+        complete_execution,
+        start_execution,
+    )
+    from models import Execution, Worker  # noqa: E402
     from queue_reconciliation import ReconciliationResult  # noqa: E402
+    from worker_registry import (  # noqa: E402
+        heartbeat_worker,
+        register_worker,
+    )
+
+
+class RecordingRedis:
+    def __init__(self):
+        self.entries = []
+
+    def lpush(self, _queue_name, execution_id):
+        self.entries.insert(0, execution_id)
 
 
 @pytest_asyncio.fixture
@@ -42,9 +59,10 @@ async def session_factory():
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def clear_executions(session_factory):
+async def clear_database(session_factory):
     async with session_factory() as session:
         await session.execute(Execution.__table__.delete())
+        await session.execute(Worker.__table__.delete())
         await session.commit()
 
 
@@ -160,3 +178,88 @@ async def test_lifespan_starts_and_cancels_recovery_loop(monkeypatch):
         await asyncio.wait_for(started.wait(), timeout=1)
 
     await asyncio.wait_for(stopped.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_worker_crash_recovery_cycle_allows_reclaim(session_factory, monkeypatch):
+    worker_crashed = "worker-crashed"
+    worker_recovering = "worker-recovering"
+
+    async with session_factory() as session:
+        execution = Execution(status="QUEUED")
+        session.add(execution)
+        await session.commit()
+        await session.refresh(execution)
+        execution_id = execution.id
+
+    async with session_factory() as session:
+        reg_1 = await register_worker(session, worker_crashed)
+        assert reg_1.status == "ACTIVE"
+        last_hb = await heartbeat_worker(session, worker_crashed)
+        assert last_hb is not None
+
+        claim_1 = await claim_execution(
+            session,
+            execution_id,
+            worker_crashed,
+            lease_duration=timedelta(seconds=-1),
+        )
+        assert claim_1 is not None
+        assert claim_1.worker_id == worker_crashed
+
+        started = await start_execution(session, claim_1)
+        assert started is True
+
+    async with session_factory() as session:
+        row = await session.get(Execution, execution_id)
+        assert row.status == "RUNNING"
+        assert row.worker_id == worker_crashed
+        assert row.lease_until < datetime.now(timezone.utc)
+
+    recording_redis = RecordingRedis()
+    monkeypatch.setattr(main, "AsyncSessionLocal", session_factory)
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setattr(main.redis, "from_url", lambda *args, **kwargs: recording_redis)
+
+    recovered_ids, reconciliation = await main.run_recovery_cycle()
+
+    assert recovered_ids == [execution_id]
+    assert reconciliation is not None
+    assert reconciliation.enqueued == 1
+    assert recording_redis.entries == [execution_id]
+
+    async with session_factory() as session:
+        # The expired worker cannot complete the job after ownership was recovered
+        assert await complete_execution(session, claim_1) is False
+
+        row = await session.get(Execution, execution_id)
+        assert row.status == "QUEUED"
+        assert row.worker_id is None
+        assert row.lease_until is None
+        assert row.attempt == 1
+
+    queued_id = recording_redis.entries.pop()
+    assert queued_id == execution_id
+
+    async with session_factory() as session:
+        reg_2 = await register_worker(session, worker_recovering)
+        assert reg_2.status == "ACTIVE"
+        await heartbeat_worker(session, worker_recovering)
+
+        claim_2 = await claim_execution(
+            session,
+            queued_id,
+            worker_recovering,
+            lease_duration=timedelta(seconds=30),
+        )
+        assert claim_2 is not None
+        assert claim_2.worker_id == worker_recovering
+        assert claim_2.execution_id == execution_id
+
+        assert await start_execution(session, claim_2) is True
+        assert await complete_execution(session, claim_2) is True
+
+        completed_row = await session.get(Execution, execution_id)
+        assert completed_row.status == "SUCCEEDED"
+        assert completed_row.worker_id == worker_recovering
+        assert completed_row.finished_at is not None
