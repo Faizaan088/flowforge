@@ -29,3 +29,12 @@ class Execution(Base):
     started_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)
     error_summary = Column(String, nullable=True)
+
+
+class Worker(Base):
+    __tablename__ = "workers"
+
+    worker_id = Column(String, primary_key=True)
+    status = Column(String, nullable=False, default="ACTIVE")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    last_heartbeat_at = Column(DateTime(timezone=True), nullable=False)
