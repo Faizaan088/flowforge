@@ -4,14 +4,16 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import os
 import redis
+from redis.exceptions import RedisError
 from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import and_
 
-from database import engine, Base, get_db
+from database import engine, Base, get_db, AsyncSessionLocal
 import models 
+from queue_reconciliation import enqueue_execution, reconcile_queued_executions
 
 class JobCreate(BaseModel):
     name: str
@@ -23,10 +25,24 @@ async def lifespan(app: FastAPI):
     print("BOOTING UP API AND CHECKING DATABASE...")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    async with AsyncSessionLocal() as session:
+        reconciliation = await reconcile_queue(session)
+        if reconciliation is not None:
+            print(f"Startup queue reconciliation: {reconciliation.as_dict()}")
     yield
     print("SHUTTING DOWN...")
 
 app = FastAPI(title="FlowForge API", version="0.1.0", lifespan=lifespan)
+
+
+async def reconcile_queue(db: AsyncSession):
+    r_url = os.getenv("REDIS_URL")
+    if not r_url:
+        print("Redis is not configured; queued executions remain durable in Postgres.")
+        return None
+
+    redis_client = redis.from_url(r_url, decode_responses=True)
+    return await reconcile_queued_executions(db, redis_client)
 
 @app.get("/health")
 async def health_check():
@@ -58,10 +74,14 @@ async def trigger_job(job_id: int, db: AsyncSession = Depends(get_db)):
     await db.refresh(new_execution)
     
     print(f"Queued execution {new_execution.id} in Postgres...")
-    
+
     r_url = os.getenv("REDIS_URL")
     redis_client = redis.from_url(r_url, decode_responses=True)
-    redis_client.lpush("flowforge:queue", new_execution.id)
+    # Redis delivery follows the durable commit; reconciliation replays failures.
+    try:
+        enqueue_execution(redis_client, new_execution.id)
+    except RedisError as error:
+        print(f"Redis enqueue failed for execution {new_execution.id}: {error}")
     
     return new_execution
 
@@ -69,6 +89,14 @@ async def trigger_job(job_id: int, db: AsyncSession = Depends(get_db)):
 async def list_executions(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(models.Execution))
     return result.scalars().all()
+
+
+@app.post("/system/reconcile-queue")
+async def reconcile_execution_queue(db: AsyncSession = Depends(get_db)):
+    reconciliation = await reconcile_queue(db)
+    if reconciliation is None:
+        raise HTTPException(status_code=503, detail="Redis is not configured")
+    return reconciliation.as_dict()
 
 @app.post("/system/sweep")
 async def sweep_dead_jobs(db: AsyncSession = Depends(get_db)):
