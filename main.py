@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from contextlib import asynccontextmanager, suppress
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+from datetime import datetime, timezone
 import os
 import redis
 import asyncio
@@ -13,7 +14,12 @@ from sqlalchemy.future import select
 from database import engine, Base, get_db, AsyncSessionLocal
 import models 
 from execution_recovery import recover_expired_executions
-from queue_reconciliation import enqueue_execution, reconcile_queued_executions
+from execution_retry import requeue_eligible_retries
+from queue_reconciliation import (
+    deliver_executions_to_redis,
+    enqueue_execution,
+    reconcile_queued_executions,
+)
 
 
 RECOVERY_INTERVAL_SECONDS = float(
@@ -46,23 +52,31 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="FlowForge API", version="0.1.0", lifespan=lifespan)
 
 
-async def reconcile_queue(db: AsyncSession):
+async def reconcile_queue(db: AsyncSession, execution_ids: Optional[list[int]] = None):
     r_url = os.getenv("REDIS_URL")
     if not r_url:
         print("Redis is not configured; queued executions remain durable in Postgres.")
         return None
 
     redis_client = redis.from_url(r_url, decode_responses=True)
+    if execution_ids is not None:
+        return deliver_executions_to_redis(redis_client, execution_ids)
     return await reconcile_queued_executions(db, redis_client)
 
 
-async def run_recovery_cycle():
+async def run_recovery_cycle(now: Optional[datetime] = None):
+    current_time = now or datetime.now(timezone.utc)
     async with AsyncSessionLocal() as session:
-        recovered_ids = await recover_expired_executions(session)
+        lease_recovered_ids = await recover_expired_executions(session, now=current_time)
+        retry_requeued_ids = await requeue_eligible_retries(session, now=current_time)
+        requeued_ids = lease_recovered_ids + retry_requeued_ids
         reconciliation = None
-        if recovered_ids:
-            reconciliation = await reconcile_queue(session)
-    return recovered_ids, reconciliation
+        if requeued_ids:
+            try:
+                reconciliation = await reconcile_queue(session, execution_ids=requeued_ids)
+            except TypeError:
+                reconciliation = await reconcile_queue(session)
+    return requeued_ids, reconciliation
 
 
 async def recovery_loop(interval_seconds: float = RECOVERY_INTERVAL_SECONDS):
@@ -70,7 +84,7 @@ async def recovery_loop(interval_seconds: float = RECOVERY_INTERVAL_SECONDS):
         try:
             recovered_ids, reconciliation = await run_recovery_cycle()
             if recovered_ids:
-                print(f"Recovered expired executions: {recovered_ids}")
+                print(f"Recovered/requeued executions: {recovered_ids}")
             if reconciliation is not None and reconciliation.redis_error:
                 print(f"Queue reconciliation failed: {reconciliation.redis_error}")
         except Exception as error:

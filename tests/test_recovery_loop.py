@@ -15,6 +15,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 if TEST_DATABASE_URL:
+    from redis.exceptions import RedisError
     from sqlalchemy import select
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
     from sqlalchemy.pool import NullPool
@@ -37,10 +38,16 @@ if TEST_DATABASE_URL:
 
 
 class RecordingRedis:
-    def __init__(self):
+    def __init__(self, unavailable=False, fail_after=None):
         self.entries = []
+        self.unavailable = unavailable
+        self.fail_after = fail_after
 
     def lpush(self, _queue_name, execution_id):
+        if self.unavailable or (
+            self.fail_after is not None and len(self.entries) >= self.fail_after
+        ):
+            raise RedisError("Redis is unavailable")
         self.entries.insert(0, execution_id)
 
 
@@ -263,3 +270,226 @@ async def test_worker_crash_recovery_cycle_allows_reclaim(session_factory, monke
         assert completed_row.status == "SUCCEEDED"
         assert completed_row.worker_id == worker_recovering
         assert completed_row.finished_at is not None
+
+
+@pytest.mark.asyncio
+async def test_recovery_cycle_requeues_and_delivers_eligible_retry(
+    session_factory, monkeypatch
+):
+    base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    async with session_factory() as session:
+        eligible_retry = Execution(
+            status="RETRY_WAIT",
+            available_at=base_time - timedelta(seconds=10),
+            attempt=1,
+        )
+        existing_queued = Execution(
+            status="QUEUED",
+            attempt=1,
+        )
+        session.add_all([eligible_retry, existing_queued])
+        await session.commit()
+        await session.refresh(eligible_retry)
+        await session.refresh(existing_queued)
+        retry_id = eligible_retry.id
+        existing_id = existing_queued.id
+
+    recording_redis = RecordingRedis()
+    monkeypatch.setattr(main, "AsyncSessionLocal", session_factory)
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setattr(main.redis, "from_url", lambda *args, **kwargs: recording_redis)
+
+    requeued_ids, reconciliation = await main.run_recovery_cycle(now=base_time)
+
+    assert requeued_ids == [retry_id]
+    assert reconciliation is not None
+    assert reconciliation.enqueued == 1
+    assert reconciliation.redis_error is None
+    assert recording_redis.entries == [retry_id]
+
+    async with session_factory() as session:
+        retry_row = await session.get(Execution, retry_id)
+        assert retry_row.status == "QUEUED"
+        assert retry_row.available_at is None
+        assert retry_row.attempt == 2
+
+        existing_row = await session.get(Execution, existing_id)
+        assert existing_row.status == "QUEUED"
+        assert existing_row.attempt == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_cycle_ignores_future_retry(session_factory, monkeypatch):
+    base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    async with session_factory() as session:
+        future_retry = Execution(
+            status="RETRY_WAIT",
+            available_at=base_time + timedelta(seconds=30),
+            attempt=1,
+        )
+        session.add(future_retry)
+        await session.commit()
+        await session.refresh(future_retry)
+        retry_id = future_retry.id
+
+    recording_redis = RecordingRedis()
+    monkeypatch.setattr(main, "AsyncSessionLocal", session_factory)
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setattr(main.redis, "from_url", lambda *args, **kwargs: recording_redis)
+
+    requeued_ids, reconciliation = await main.run_recovery_cycle(now=base_time)
+
+    assert requeued_ids == []
+    assert reconciliation is None
+    assert recording_redis.entries == []
+
+    async with session_factory() as session:
+        row = await session.get(Execution, retry_id)
+        assert row.status == "RETRY_WAIT"
+        assert row.attempt == 1
+        assert row.available_at == base_time + timedelta(seconds=30)
+
+
+@pytest.mark.asyncio
+async def test_recovery_cycle_handles_multiple_eligible_retries(
+    session_factory, monkeypatch
+):
+    base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    async with session_factory() as session:
+        eligible_1 = Execution(
+            status="RETRY_WAIT",
+            available_at=base_time - timedelta(seconds=20),
+            attempt=1,
+        )
+        eligible_2 = Execution(
+            status="RETRY_WAIT",
+            available_at=base_time - timedelta(seconds=5),
+            attempt=2,
+        )
+        future_retry = Execution(
+            status="RETRY_WAIT",
+            available_at=base_time + timedelta(seconds=60),
+            attempt=1,
+        )
+        session.add_all([eligible_1, eligible_2, future_retry])
+        await session.commit()
+        await session.refresh(eligible_1)
+        await session.refresh(eligible_2)
+        await session.refresh(future_retry)
+        id_1 = eligible_1.id
+        id_2 = eligible_2.id
+        id_future = future_retry.id
+
+    recording_redis = RecordingRedis()
+    monkeypatch.setattr(main, "AsyncSessionLocal", session_factory)
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setattr(main.redis, "from_url", lambda *args, **kwargs: recording_redis)
+
+    requeued_ids, reconciliation = await main.run_recovery_cycle(now=base_time)
+
+    assert set(requeued_ids) == {id_1, id_2}
+    assert reconciliation is not None
+    assert reconciliation.enqueued == 2
+    assert set(recording_redis.entries) == {id_1, id_2}
+
+    async with session_factory() as session:
+        row_1 = await session.get(Execution, id_1)
+        assert row_1.status == "QUEUED"
+        assert row_1.attempt == 2
+        assert row_1.available_at is None
+
+        row_2 = await session.get(Execution, id_2)
+        assert row_2.status == "QUEUED"
+        assert row_2.attempt == 3
+        assert row_2.available_at is None
+
+        row_future = await session.get(Execution, id_future)
+        assert row_future.status == "RETRY_WAIT"
+        assert row_future.attempt == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_cycle_redis_failure_preserves_durable_db_state(
+    session_factory, monkeypatch
+):
+    base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    async with session_factory() as session:
+        retry_execution = Execution(
+            status="RETRY_WAIT",
+            available_at=base_time - timedelta(seconds=5),
+            attempt=1,
+        )
+        session.add(retry_execution)
+        await session.commit()
+        await session.refresh(retry_execution)
+        execution_id = retry_execution.id
+
+    failing_redis = RecordingRedis(unavailable=True)
+    monkeypatch.setattr(main, "AsyncSessionLocal", session_factory)
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setattr(main.redis, "from_url", lambda *args, **kwargs: failing_redis)
+
+    requeued_ids, reconciliation = await main.run_recovery_cycle(now=base_time)
+
+    assert requeued_ids == [execution_id]
+    assert reconciliation is not None
+    assert reconciliation.enqueued == 0
+    assert reconciliation.redis_error is not None
+    assert "Redis is unavailable" in reconciliation.redis_error
+
+    async with session_factory() as session:
+        row = await session.get(Execution, execution_id)
+        assert row.status == "QUEUED"
+        assert row.attempt == 2
+        assert row.available_at is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_cycle_handles_both_expired_leases_and_eligible_retries(
+    session_factory, monkeypatch
+):
+    base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    async with session_factory() as session:
+        expired_lease = Execution(
+            status="RUNNING",
+            worker_id="worker-crashed",
+            lease_until=base_time - timedelta(seconds=15),
+            attempt=1,
+        )
+        eligible_retry = Execution(
+            status="RETRY_WAIT",
+            available_at=base_time - timedelta(seconds=10),
+            attempt=1,
+        )
+        session.add_all([expired_lease, eligible_retry])
+        await session.commit()
+        await session.refresh(expired_lease)
+        await session.refresh(eligible_retry)
+        lease_id = expired_lease.id
+        retry_id = eligible_retry.id
+
+    recording_redis = RecordingRedis()
+    monkeypatch.setattr(main, "AsyncSessionLocal", session_factory)
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setattr(main.redis, "from_url", lambda *args, **kwargs: recording_redis)
+
+    requeued_ids, reconciliation = await main.run_recovery_cycle(now=base_time)
+
+    assert set(requeued_ids) == {lease_id, retry_id}
+    assert reconciliation is not None
+    assert reconciliation.enqueued == 2
+    assert set(recording_redis.entries) == {lease_id, retry_id}
+
+    async with session_factory() as session:
+        recovered_row = await session.get(Execution, lease_id)
+        assert recovered_row.status == "QUEUED"
+        assert recovered_row.worker_id is None
+        assert recovered_row.lease_until is None
+        assert recovered_row.attempt == 2
+
+        retry_row = await session.get(Execution, retry_id)
+        assert retry_row.status == "QUEUED"
+        assert retry_row.worker_id is None
+        assert retry_row.available_at is None
+        assert retry_row.attempt == 2
+

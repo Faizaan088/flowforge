@@ -31,6 +31,24 @@ def enqueue_execution(redis_client, execution_id: int) -> None:
     redis_client.lpush(QUEUE_NAME, execution_id)
 
 
+def deliver_executions_to_redis(
+    redis_client, execution_ids: list[int]
+) -> ReconciliationResult:
+    """Deliver a specific list of execution IDs to Redis."""
+    enqueued = 0
+    for execution_id in execution_ids:
+        try:
+            enqueue_execution(redis_client, execution_id)
+            enqueued += 1
+        except RedisError as error:
+            return ReconciliationResult(
+                found=len(execution_ids),
+                enqueued=enqueued,
+                redis_error=str(error),
+            )
+    return ReconciliationResult(found=len(execution_ids), enqueued=enqueued)
+
+
 async def reconcile_queued_executions(
     session: AsyncSession,
     redis_client,
