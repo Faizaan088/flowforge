@@ -87,14 +87,40 @@ async def transition_failed_execution(
             )
             row.status = "RETRY_WAIT"
             row.available_at = current_time + delay
-            return "RETRY_WAIT"
+            outcome = "RETRY_WAIT"
         else:
             row.status = "DEAD_LETTERED"
             row.available_at = None
             row.finished_at = current_time
             outcome = "DEAD_LETTERED"
 
-    if outcome == "DEAD_LETTERED":
+    from events import (
+        EVENT_EXECUTION_DEAD_LETTERED,
+        EVENT_EXECUTION_RETRY_WAITING,
+        create_event,
+        publish_event,
+    )
+
+    if outcome == "RETRY_WAIT":
+        publish_event(
+            redis_client,
+            create_event(
+                EVENT_EXECUTION_RETRY_WAITING,
+                execution_id=int(execution_id),
+                status="RETRY_WAIT",
+                metadata={"attempt": current_attempt + 1},
+            ),
+        )
+    elif outcome == "DEAD_LETTERED":
+        publish_event(
+            redis_client,
+            create_event(
+                EVENT_EXECUTION_DEAD_LETTERED,
+                execution_id=int(execution_id),
+                status="DEAD_LETTERED",
+                metadata={"attempt": current_attempt},
+            ),
+        )
         from workflow_engine import advance_workflow_on_execution_terminal
         await advance_workflow_on_execution_terminal(
             session, int(execution_id), redis_client=redis_client
@@ -205,6 +231,7 @@ async def requeue_retry_execution(
 async def requeue_eligible_retries(
     session: AsyncSession,
     now: datetime | None = None,
+    redis_client=None,
 ) -> list[int]:
     """Transition all eligible RETRY_WAIT executions back to QUEUED."""
     requeue_time = now or datetime.now(timezone.utc)
@@ -229,6 +256,18 @@ async def requeue_eligible_retries(
             .returning(Execution.id)
         )
         requeued_ids = list(result.scalars())
+
+    from events import EVENT_EXECUTION_QUEUED, create_event, publish_event
+    for eid in requeued_ids:
+        publish_event(
+            redis_client,
+            create_event(
+                EVENT_EXECUTION_QUEUED,
+                execution_id=eid,
+                status="QUEUED",
+                metadata={"requeued_from_retry": True},
+            ),
+        )
 
     return requeued_ids
 

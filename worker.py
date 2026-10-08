@@ -52,6 +52,7 @@ async def claim_and_run(execution_id, worker_id=WORKER_ID, redis_conn=None):
             execution_id,
             worker_id,
             LEASE_DURATION,
+            redis_client=redis_conn,
         )
 
         if claim is None:
@@ -63,7 +64,7 @@ async def claim_and_run(execution_id, worker_id=WORKER_ID, redis_conn=None):
             f"until {claim.lease_until.isoformat()}..."
         )
 
-        if not await start_execution(session, claim):
+        if not await start_execution(session, claim, redis_client=redis_conn):
             print(f"Execution {execution_id} is no longer owned by {worker_id}; skipping it.")
             return
 

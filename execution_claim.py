@@ -47,6 +47,7 @@ async def claim_execution(
     worker_id: str,
     lease_duration: timedelta,
     now: datetime | None = None,
+    redis_client=None,
 ) -> ExecutionClaim | None:
     """Atomically claim a queued execution, enforcing concurrency and rate limits.
 
@@ -77,11 +78,24 @@ async def claim_execution(
         claimed_worker_id = row.worker_id
         claimed_lease_until = row.lease_until
 
-    return ExecutionClaim(
+    claim = ExecutionClaim(
         execution_id=claimed_id,
         worker_id=claimed_worker_id,
         lease_until=claimed_lease_until,
     )
+
+    from events import EVENT_EXECUTION_CLAIMED, create_event, publish_event
+    publish_event(
+        redis_client,
+        create_event(
+            EVENT_EXECUTION_CLAIMED,
+            execution_id=claimed_id,
+            status="CLAIMED",
+            worker_id=claimed_worker_id,
+            metadata={"lease_until": claimed_lease_until.isoformat()},
+        ),
+    )
+    return claim
 
 
 async def claim_next_execution(
@@ -89,6 +103,7 @@ async def claim_next_execution(
     worker_id: str,
     lease_duration: timedelta,
     now: datetime | None = None,
+    redis_client=None,
 ) -> ExecutionClaim | None:
     """Atomically claim the highest-priority runnable QUEUED execution.
 
@@ -104,6 +119,7 @@ async def claim_next_execution(
     """
     current_time = now or datetime.now(timezone.utc)
     lease_until = current_time + lease_duration
+    claimed_claim = None
 
     async with _atomic_session(session):
         stmt = (
@@ -136,18 +152,32 @@ async def claim_next_execution(
             row.status = "CLAIMED"
             row.worker_id = worker_id
             row.lease_until = lease_until
-            return ExecutionClaim(
+            claimed_claim = ExecutionClaim(
                 execution_id=row.id,
                 worker_id=row.worker_id,
                 lease_until=row.lease_until,
             )
+            break
 
-    return None
+    if claimed_claim is not None:
+        from events import EVENT_EXECUTION_CLAIMED, create_event, publish_event
+        publish_event(
+            redis_client,
+            create_event(
+                EVENT_EXECUTION_CLAIMED,
+                execution_id=claimed_claim.execution_id,
+                status="CLAIMED",
+                worker_id=claimed_claim.worker_id,
+                metadata={"lease_until": claimed_claim.lease_until.isoformat()},
+            ),
+        )
+    return claimed_claim
 
 
 async def start_execution(
     session: AsyncSession,
     claim: ExecutionClaim,
+    redis_client=None,
 ) -> bool:
     """Transition an execution to RUNNING only for its exact claim owner."""
     async with session.begin():
@@ -162,7 +192,20 @@ async def start_execution(
             .values(status="RUNNING", started_at=datetime.now(timezone.utc))
             .returning(Execution.id)
         )
-        return result.scalar_one_or_none() is not None
+        started = result.scalar_one_or_none() is not None
+
+    if started:
+        from events import EVENT_EXECUTION_RUNNING, create_event, publish_event
+        publish_event(
+            redis_client,
+            create_event(
+                EVENT_EXECUTION_RUNNING,
+                execution_id=claim.execution_id,
+                status="RUNNING",
+                worker_id=claim.worker_id,
+            ),
+        )
+    return started
 
 
 async def complete_execution(
@@ -191,6 +234,17 @@ async def complete_execution(
 
     if not succeeded:
         return False
+
+    from events import EVENT_EXECUTION_SUCCEEDED, create_event, publish_event
+    publish_event(
+        redis_client,
+        create_event(
+            EVENT_EXECUTION_SUCCEEDED,
+            execution_id=claim.execution_id,
+            status="SUCCEEDED",
+            worker_id=claim.worker_id,
+        ),
+    )
 
     from workflow_engine import advance_workflow_on_execution_terminal
     await advance_workflow_on_execution_terminal(
@@ -223,7 +277,21 @@ async def fail_execution(
             )
             .returning(Execution.id)
         )
-        return result.scalar_one_or_none() is not None
+        failed = result.scalar_one_or_none() is not None
+
+    if failed:
+        from events import EVENT_EXECUTION_FAILED, create_event, publish_event
+        publish_event(
+            redis_client,
+            create_event(
+                EVENT_EXECUTION_FAILED,
+                execution_id=claim.execution_id,
+                status="FAILED",
+                worker_id=claim.worker_id,
+                metadata={"error_summary": error_summary},
+            ),
+        )
+    return failed
 
 
 async def cancel_execution(
@@ -283,12 +351,24 @@ async def cancel_execution(
         row.error_summary = reason or "Execution cancelled"
         cancelled_now = True
 
-    if cancelled_now and advance_workflow:
-        from workflow_engine import advance_workflow_on_execution_terminal
-
-        await advance_workflow_on_execution_terminal(
-            session, int(execution_id), redis_client=redis_client
+    if cancelled_now:
+        from events import EVENT_EXECUTION_CANCELLED, create_event, publish_event
+        publish_event(
+            redis_client,
+            create_event(
+                EVENT_EXECUTION_CANCELLED,
+                execution_id=int(execution_id),
+                status="CANCELLED",
+                metadata={"reason": reason or "Execution cancelled"},
+            ),
         )
+
+        if advance_workflow:
+            from workflow_engine import advance_workflow_on_execution_terminal
+
+            await advance_workflow_on_execution_terminal(
+                session, int(execution_id), redis_client=redis_client
+            )
 
     return CancellationResult(
         execution_id=int(execution_id),
@@ -302,12 +382,27 @@ async def update_execution_priority(
     session: AsyncSession,
     execution_id: int,
     priority: int,
+    redis_client=None,
 ) -> Execution | None:
     """Update priority of a QUEUED execution. Returns updated Execution or None if not QUEUED/not found."""
+    updated_row = None
     async with _atomic_session(session):
         row = await session.get(Execution, int(execution_id), with_for_update=True)
         if row is None or row.status != "QUEUED":
             return None
         row.priority = int(priority)
-        return row
+        updated_row = row
+
+    if updated_row is not None:
+        from events import EVENT_EXECUTION_PRIORITY_CHANGED, create_event, publish_event
+        publish_event(
+            redis_client,
+            create_event(
+                EVENT_EXECUTION_PRIORITY_CHANGED,
+                execution_id=int(execution_id),
+                status=updated_row.status,
+                metadata={"priority": int(priority)},
+            ),
+        )
+    return updated_row
 

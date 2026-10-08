@@ -1,4 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException
+import json
+import logging
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from contextlib import asynccontextmanager, suppress
 from pydantic import BaseModel, ConfigDict
 from typing import Optional, Dict, Any
@@ -41,6 +43,9 @@ from queue_reconciliation import (
 )
 from workflow_engine import WorkflowValidationError, cancel_workflow_run
 from auth import (
+    ROLE_ADMIN,
+    ROLE_OBSERVER,
+    ROLE_OPERATOR,
     LoginRequest,
     TokenResponse,
     UserAlreadyExistsError,
@@ -54,6 +59,13 @@ from auth import (
     list_users,
     require_permission,
     require_role,
+)
+from events import (
+    EVENT_EXECUTION_QUEUED,
+    authenticate_websocket,
+    create_event,
+    manager,
+    publish_event,
 )
 
 
@@ -149,6 +161,9 @@ async def lifespan(app: FastAPI):
         reconciliation = await reconcile_queue(session)
         if reconciliation is not None:
             print(f"Startup queue reconciliation: {reconciliation.as_dict()}")
+    r_url = os.getenv("REDIS_URL")
+    if r_url:
+        await manager.start_redis_listener(r_url)
     recovery_task = asyncio.create_task(recovery_loop())
     try:
         yield
@@ -156,6 +171,7 @@ async def lifespan(app: FastAPI):
         recovery_task.cancel()
         with suppress(asyncio.CancelledError):
             await recovery_task
+        await manager.stop_redis_listener()
         print("SHUTTING DOWN...")
 
 app = FastAPI(title="FlowForge API", version="0.1.0", lifespan=lifespan)
@@ -175,9 +191,15 @@ async def reconcile_queue(db: AsyncSession, execution_ids: Optional[list[int]] =
 
 async def run_recovery_cycle(now: Optional[datetime] = None):
     current_time = now or datetime.now(timezone.utc)
+    r_url = os.getenv("REDIS_URL")
+    redis_client = redis.from_url(r_url, decode_responses=True) if r_url else None
     async with AsyncSessionLocal() as session:
-        lease_recovered_ids = await recover_expired_executions(session, now=current_time)
-        retry_requeued_ids = await requeue_eligible_retries(session, now=current_time)
+        lease_recovered_ids = await recover_expired_executions(
+            session, now=current_time, redis_client=redis_client
+        )
+        retry_requeued_ids = await requeue_eligible_retries(
+            session, now=current_time, redis_client=redis_client
+        )
         requeued_ids = lease_recovered_ids + retry_requeued_ids
         reconciliation = None
         if requeued_ids:
@@ -359,6 +381,17 @@ async def trigger_job(
         except RedisError as error:
             print(f"Redis enqueue failed for execution {new_execution.id}: {error}")
     
+    publish_event(
+        redis_client,
+        create_event(
+            EVENT_EXECUTION_QUEUED,
+            execution_id=new_execution.id,
+            job_id=new_execution.job_definition_id,
+            status="QUEUED",
+            metadata={"priority": new_execution.priority, "category": new_execution.category},
+        ),
+    )
+
     return new_execution
 
 
@@ -421,6 +454,8 @@ async def update_execution_priority_route(
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(require_permission("executions:priority")),
 ):
+    r_url = os.getenv("REDIS_URL")
+    redis_client = redis.from_url(r_url, decode_responses=True) if r_url else None
     row = await db.get(models.Execution, execution_id)
     if not row:
         raise HTTPException(status_code=404, detail="Execution not found")
@@ -429,7 +464,7 @@ async def update_execution_priority_route(
             status_code=409,
             detail=f"Cannot change priority of execution in status '{row.status}'",
         )
-    updated = await update_execution_priority(db, execution_id, payload.priority)
+    updated = await update_execution_priority(db, execution_id, payload.priority, redis_client=redis_client)
     await db.commit()
     await db.refresh(updated)
     return updated
@@ -476,7 +511,9 @@ async def sweep_dead_jobs(
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(require_permission("system:reconcile")),
 ):
-    recovered_ids = await recover_expired_executions(db)
+    r_url = os.getenv("REDIS_URL")
+    redis_client = redis.from_url(r_url, decode_responses=True) if r_url else None
+    recovered_ids = await recover_expired_executions(db, redis_client=redis_client)
     if not recovered_ids:
         return {"message": "All clean! No dead jobs found."}
 
@@ -830,5 +867,125 @@ async def delete_rate_limit_policy_route(
         raise HTTPException(status_code=404, detail="Rate limit policy not found")
     await db.commit()
     return {"message": "Rate limit policy deleted", "id": policy_id}
+
+
+# ---------------------------------------------------------------------------
+# WebSocket Live Execution Events Stream
+# ---------------------------------------------------------------------------
+@app.websocket("/ws/events")
+async def websocket_events_endpoint(
+    websocket: WebSocket,
+    session: AsyncSession = Depends(get_db),
+):
+    """Real-time live execution event stream over WebSocket.
+
+    Protected with JWT authentication via query string (`?token=...`),
+    Authorization header (`Bearer ...`), or subprotocol (`token.<jwt>`).
+    Enforces RBAC (Observer, Operator, Admin) and supports subscription filtering,
+    ping/pong keepalive, and initial state snapshots.
+    """
+    user = await authenticate_websocket(websocket, session)
+    if user is None or user.role not in [ROLE_ADMIN, ROLE_OPERATOR, ROLE_OBSERVER]:
+        await websocket.close(code=1008)
+        return
+
+    conn = await manager.connect(websocket, user)
+
+    # Initial connection acknowledgment
+    await websocket.send_text(
+        json.dumps({
+            "type": "connected",
+            "user": conn.user.username,
+            "role": conn.user.role,
+            "subscription": conn.subscription.to_dict(),
+        })
+    )
+
+    async def sender():
+        try:
+            while conn.is_active:
+                event = await conn.queue.get()
+                await websocket.send_text(event.to_json())
+                conn.queue.task_done()
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+        except Exception as exc:
+            logging.getLogger("flowforge.events").debug("WebSocket sender terminated: %s", exc)
+
+    sender_task = asyncio.create_task(sender())
+
+    try:
+        while True:
+            raw_text = await websocket.receive_text()
+            try:
+                data = json.loads(raw_text)
+            except Exception:
+                if raw_text.strip().lower() == "ping":
+                    data = {"action": "ping"}
+                else:
+                    continue
+
+            action = data.get("action") or data.get("type")
+            if action == "ping":
+                await websocket.send_text(
+                    json.dumps({
+                        "type": "pong",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                )
+            elif action == "subscribe":
+                filters = data.get("filter") or data.get("filters") or {}
+                if isinstance(filters, str):
+                    if filters == "all":
+                        filters = {"all": True}
+                    else:
+                        filters = {}
+                conn.update_subscription(filters)
+                await websocket.send_text(
+                    json.dumps({
+                        "type": "subscribed",
+                        "subscription": conn.subscription.to_dict(),
+                    })
+                )
+            elif action == "snapshot":
+                stmt = (
+                    select(models.Execution)
+                    .order_by(models.Execution.id.desc())
+                    .limit(50)
+                )
+                exec_id = data.get("execution_id")
+                if exec_id is not None:
+                    stmt = select(models.Execution).where(
+                        models.Execution.id == int(exec_id)
+                    )
+                res = await session.execute(stmt)
+                rows = res.scalars().all()
+                snapshot = [
+                    {
+                        "id": r.id,
+                        "job_definition_id": r.job_definition_id,
+                        "status": r.status,
+                        "priority": r.priority,
+                        "category": r.category,
+                        "attempt": r.attempt,
+                    }
+                    for r in rows
+                ]
+                await websocket.send_text(
+                    json.dumps({
+                        "type": "snapshot",
+                        "executions": snapshot,
+                    })
+                )
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass
+    except Exception as exc:
+        logging.getLogger("flowforge.events").debug("WebSocket session closed: %s", exc)
+    finally:
+        sender_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await sender_task
+        await manager.disconnect(conn)
+
 
 

@@ -514,6 +514,18 @@ async def dispatch_due_occurrences(
     # Persist durable queue state in PostgreSQL before attempting best-effort Redis delivery
     await session.commit()
 
+    from events import EVENT_EXECUTION_QUEUED, create_event, publish_event
+    for eid in created_execution_ids:
+        publish_event(
+            redis_client,
+            create_event(
+                EVENT_EXECUTION_QUEUED,
+                execution_id=eid,
+                status="QUEUED",
+                metadata={"source": "scheduler"},
+            ),
+        )
+
     reconciliation = None
     if redis_client is not None and created_execution_ids:
         reconciliation = deliver_executions_to_redis(redis_client, created_execution_ids)

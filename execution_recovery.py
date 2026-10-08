@@ -14,6 +14,7 @@ RECOVERABLE_STATUSES = ("CLAIMED", "RUNNING")
 async def recover_expired_executions(
     session: AsyncSession,
     now: datetime | None = None,
+    redis_client=None,
 ) -> list[int]:
     """Return expired claimed/running work to QUEUED in one transaction."""
     recovery_time = now or datetime.now(timezone.utc)
@@ -35,5 +36,17 @@ async def recover_expired_executions(
             .returning(Execution.id)
         )
         recovered_ids = list(result.scalars())
+
+    from events import EVENT_EXECUTION_RECOVERED, create_event, publish_event
+    for eid in recovered_ids:
+        publish_event(
+            redis_client,
+            create_event(
+                EVENT_EXECUTION_RECOVERED,
+                execution_id=eid,
+                status="QUEUED",
+                metadata={"recovered_lease_expired": True},
+            ),
+        )
 
     return recovered_ids

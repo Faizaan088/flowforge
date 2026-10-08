@@ -832,6 +832,19 @@ async def dispatch_ready_tasks(
     # Durable PostgreSQL state is committed first
     await session.commit()
 
+    from events import EVENT_EXECUTION_QUEUED, create_event, publish_event
+    for eid in created_exec_ids:
+        publish_event(
+            redis_client,
+            create_event(
+                EVENT_EXECUTION_QUEUED,
+                execution_id=eid,
+                status="QUEUED",
+                workflow_id=run.workflow_id,
+                workflow_run_id=workflow_run_id,
+            ),
+        )
+
     # Best-effort Redis delivery
     reconciliation = None
     if redis_client is not None and created_exec_ids:
@@ -1009,6 +1022,19 @@ async def cancel_workflow_run(
         )
 
     await session.commit()
+
+    from events import EVENT_WORKFLOW_RUN_CANCELLED, create_event, publish_event
+    publish_event(
+        redis_client,
+        create_event(
+            EVENT_WORKFLOW_RUN_CANCELLED,
+            workflow_id=run.workflow_id,
+            workflow_run_id=workflow_run_id,
+            status="CANCELLED",
+            metadata={"reason": cancel_msg},
+        ),
+    )
+
     return run
 
 
