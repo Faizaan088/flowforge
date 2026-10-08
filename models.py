@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint
 from sqlalchemy.orm import relationship, synonym
 from sqlalchemy.sql import expression, func
 from database import Base
@@ -37,6 +37,12 @@ class Execution(Base):
 
     occurrence_id = synonym("schedule_occurrence_id")
     schedule_occurrence = relationship("ScheduleOccurrence", back_populates="execution", lazy="selectin")
+    workflow_task_execution = relationship(
+        "WorkflowTaskExecution",
+        back_populates="execution",
+        uselist=False,
+        lazy="selectin",
+    )
 
     __table_args__ = (
         UniqueConstraint(
@@ -166,5 +172,326 @@ class ScheduleOccurrence(Base):
         return [self.execution] if self.execution is not None else []
 
 
+class WorkflowDefinition(Base):
+    __tablename__ = "workflow_definitions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False, index=True)
+    description = Column(String, nullable=True)
+    version = Column(Integer, default=1, nullable=False)
+    status = Column(String, default="ACTIVE", nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    tasks = relationship(
+        "WorkflowTask",
+        back_populates="workflow",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    edges = relationship(
+        "WorkflowEdge",
+        back_populates="workflow",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    runs = relationship(
+        "WorkflowRun",
+        back_populates="workflow",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+    nodes = synonym("tasks")
 
 
+class WorkflowTask(Base):
+    __tablename__ = "workflow_tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workflow_id = Column(
+        Integer,
+        ForeignKey("workflow_definitions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name = Column(String, nullable=False, index=True)
+    task_type = Column(String, default="STANDARD", nullable=False)
+    config = Column(JSON, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    workflow = relationship(
+        "WorkflowDefinition",
+        back_populates="tasks",
+        lazy="selectin",
+    )
+    outgoing_edges = relationship(
+        "WorkflowEdge",
+        primaryjoin="WorkflowTask.id == WorkflowEdge.upstream_task_id",
+        back_populates="upstream_task",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    incoming_edges = relationship(
+        "WorkflowEdge",
+        primaryjoin="WorkflowTask.id == WorkflowEdge.downstream_task_id",
+        back_populates="downstream_task",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    executions = relationship(
+        "WorkflowTaskExecution",
+        back_populates="workflow_task",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("workflow_id", "name", name="uq_workflow_tasks_workflow_name"),
+    )
+
+
+WorkflowNode = WorkflowTask
+
+
+class WorkflowEdge(Base):
+    __tablename__ = "workflow_edges"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workflow_id = Column(
+        Integer,
+        ForeignKey("workflow_definitions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    upstream_task_id = Column(
+        Integer,
+        ForeignKey("workflow_tasks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    downstream_task_id = Column(
+        Integer,
+        ForeignKey("workflow_tasks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    workflow = relationship(
+        "WorkflowDefinition",
+        back_populates="edges",
+        lazy="selectin",
+    )
+    upstream_task = relationship(
+        "WorkflowTask",
+        foreign_keys=[upstream_task_id],
+        back_populates="outgoing_edges",
+        lazy="selectin",
+    )
+    downstream_task = relationship(
+        "WorkflowTask",
+        foreign_keys=[downstream_task_id],
+        back_populates="incoming_edges",
+        lazy="selectin",
+    )
+
+    upstream_node_id = synonym("upstream_task_id")
+    downstream_node_id = synonym("downstream_task_id")
+    upstream_node = synonym("upstream_task")
+    downstream_node = synonym("downstream_task")
+
+    __table_args__ = (
+        CheckConstraint(
+            "upstream_task_id != downstream_task_id",
+            name="ck_workflow_edges_no_self_dependency",
+        ),
+        UniqueConstraint(
+            "workflow_id",
+            "upstream_task_id",
+            "downstream_task_id",
+            name="uq_workflow_edges_workflow_upstream_downstream",
+        ),
+    )
+
+    def __init__(self, **kwargs):
+        if "upstream_node_id" in kwargs and "upstream_task_id" not in kwargs:
+            kwargs["upstream_task_id"] = kwargs.pop("upstream_node_id")
+        if "downstream_node_id" in kwargs and "downstream_task_id" not in kwargs:
+            kwargs["downstream_task_id"] = kwargs.pop("downstream_node_id")
+        if "upstream_node" in kwargs and "upstream_task" not in kwargs:
+            kwargs["upstream_task"] = kwargs.pop("upstream_node")
+        if "downstream_node" in kwargs and "downstream_task" not in kwargs:
+            kwargs["downstream_task"] = kwargs.pop("downstream_node")
+        super().__init__(**kwargs)
+
+
+class WorkflowRun(Base):
+    __tablename__ = "workflow_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workflow_id = Column(
+        Integer,
+        ForeignKey("workflow_definitions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status = Column(String, default="PENDING", nullable=False, index=True)
+    triggered_by = Column(String, default="MANUAL", nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    error_summary = Column(String, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    workflow = relationship(
+        "WorkflowDefinition",
+        back_populates="runs",
+        lazy="selectin",
+    )
+    task_executions = relationship(
+        "WorkflowTaskExecution",
+        back_populates="workflow_run",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+    definition_id = synonym("workflow_id")
+    workflow_definition_id = synonym("workflow_id")
+    workflow_definition = synonym("workflow")
+    tasks = synonym("task_executions")
+    task_runs = synonym("task_executions")
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')",
+            name="ck_workflow_runs_status",
+        ),
+    )
+
+    def __init__(self, **kwargs):
+        if "workflow_definition_id" in kwargs and "workflow_id" not in kwargs:
+            kwargs["workflow_id"] = kwargs.pop("workflow_definition_id")
+        if "definition_id" in kwargs and "workflow_id" not in kwargs:
+            kwargs["workflow_id"] = kwargs.pop("definition_id")
+        if "workflow_definition" in kwargs and "workflow" not in kwargs:
+            kwargs["workflow"] = kwargs.pop("workflow_definition")
+        if "status" not in kwargs:
+            kwargs["status"] = "PENDING"
+        super().__init__(**kwargs)
+
+
+class WorkflowTaskExecution(Base):
+    __tablename__ = "workflow_task_executions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workflow_run_id = Column(
+        Integer,
+        ForeignKey("workflow_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    workflow_task_id = Column(
+        Integer,
+        ForeignKey("workflow_tasks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    execution_id = Column(
+        Integer,
+        ForeignKey("executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    status = Column(String, default="PENDING", nullable=False, index=True)
+    attempt = Column(Integer, default=0, nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    error_summary = Column(String, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    workflow_run = relationship(
+        "WorkflowRun",
+        back_populates="task_executions",
+        lazy="selectin",
+    )
+    workflow_task = relationship(
+        "WorkflowTask",
+        back_populates="executions",
+        lazy="selectin",
+    )
+    execution = relationship(
+        "Execution",
+        back_populates="workflow_task_execution",
+        lazy="selectin",
+    )
+
+    run_id = synonym("workflow_run_id")
+    task_id = synonym("workflow_task_id")
+    node_id = synonym("workflow_task_id")
+    run = synonym("workflow_run")
+    task = synonym("workflow_task")
+    node = synonym("workflow_task")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_run_id",
+            "workflow_task_id",
+            name="uq_workflow_task_executions_run_task",
+        ),
+        UniqueConstraint(
+            "execution_id",
+            name="uq_workflow_task_executions_execution_id",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'READY', 'RUNNING', 'SUCCEEDED', 'FAILED', 'SKIPPED', 'CANCELLED')",
+            name="ck_workflow_task_executions_status",
+        ),
+    )
+
+    def __init__(self, **kwargs):
+        if "run_id" in kwargs and "workflow_run_id" not in kwargs:
+            kwargs["workflow_run_id"] = kwargs.pop("run_id")
+        if "task_id" in kwargs and "workflow_task_id" not in kwargs:
+            kwargs["workflow_task_id"] = kwargs.pop("task_id")
+        if "node_id" in kwargs and "workflow_task_id" not in kwargs:
+            kwargs["workflow_task_id"] = kwargs.pop("node_id")
+        if "run" in kwargs and "workflow_run" not in kwargs:
+            kwargs["workflow_run"] = kwargs.pop("run")
+        if "task" in kwargs and "workflow_task" not in kwargs:
+            kwargs["workflow_task"] = kwargs.pop("task")
+        if "node" in kwargs and "workflow_task" not in kwargs:
+            kwargs["workflow_task"] = kwargs.pop("node")
+        if "status" not in kwargs:
+            kwargs["status"] = "PENDING"
+        super().__init__(**kwargs)
+
+
+WorkflowTaskRun = WorkflowTaskExecution
+WorkflowNodeExecution = WorkflowTaskExecution
