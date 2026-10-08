@@ -5,9 +5,11 @@ from sqlalchemy.orm import declarative_base
 DB_URL = os.getenv("DATABASE_URL")
 
 if not DB_URL:
-    print("CRITICAL: DATABASE_URL is missing!")
+    DB_URL = "postgresql+asyncpg://flowforge_user:flowforge_password@127.0.0.1:5432/flowforge"
 
-engine = create_async_engine(DB_URL, echo=True)
+DB_ECHO = os.getenv("DB_ECHO", "false").lower() in ("true", "1", "yes")
+
+engine = create_async_engine(DB_URL, echo=DB_ECHO)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 Base = declarative_base()
 

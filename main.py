@@ -89,6 +89,7 @@ from metrics import (
     record_execution_transition,
     refresh_queue_gauges,
 )
+from config import get_cors_origins, validate_production_configuration
 
 
 RECOVERY_INTERVAL_SECONDS = float(
@@ -254,9 +255,14 @@ class WorkflowRunResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("BOOTING UP API AND CHECKING DATABASE...")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    print("BOOTING UP API AND CHECKING CONFIGURATION...")
+    validate_production_configuration()
+
+    if os.getenv("AUTO_CREATE_TABLES", "false").lower() == "true":
+        print("AUTO_CREATE_TABLES enabled: synchronizing schema via Base.metadata.create_all...")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
     async with AsyncSessionLocal() as session:
         await bootstrap_admin(session)
         reconciliation = await reconcile_queue(session)
@@ -276,10 +282,12 @@ async def lifespan(app: FastAPI):
         print("SHUTTING DOWN...")
 
 app = FastAPI(title="FlowForge API", version="0.1.0", lifespan=lifespan)
+cors_origins = get_cors_origins()
+allow_wildcard = "*" in cors_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=cors_origins,
+    allow_credentials=not allow_wildcard,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
