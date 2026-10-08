@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException
 from contextlib import asynccontextmanager, suppress
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 import os
@@ -13,7 +13,24 @@ from sqlalchemy.future import select
 
 from database import engine, Base, get_db, AsyncSessionLocal
 import models 
-from concurrency_policy import cleanup_expired_rate_limit_records
+from concurrency_policy import (
+    PolicyValidationError,
+    cleanup_expired_rate_limit_records,
+    delete_concurrency_limit_policy,
+    delete_rate_limit_policy,
+    get_concurrency_limit_policy,
+    get_concurrency_limit_policy_by_id,
+    get_rate_limit_policy,
+    get_rate_limit_policy_by_id,
+    list_concurrency_limit_policies,
+    list_rate_limit_policies,
+    set_concurrency_limit_policy,
+    set_concurrency_limit_policy_enabled,
+    set_rate_limit_policy,
+    set_rate_limit_policy_enabled,
+    update_concurrency_limit_policy,
+    update_rate_limit_policy,
+)
 from execution_recovery import recover_expired_executions
 from execution_retry import requeue_eligible_retries
 from queue_reconciliation import (
@@ -37,6 +54,57 @@ class JobCreate(BaseModel):
     name: str
     payload: Optional[Dict[str, Any]] = None
     priority: int = 0
+
+
+class ConcurrencyPolicyCreate(BaseModel):
+    target_type: str
+    target_id: str
+    max_concurrency: int = 1
+    is_enabled: bool = True
+
+
+class ConcurrencyPolicyUpdate(BaseModel):
+    max_concurrency: Optional[int] = None
+    is_enabled: Optional[bool] = None
+
+
+class ConcurrencyPolicyResponse(BaseModel):
+    id: int
+    target_type: str
+    target_id: str
+    max_concurrency: int
+    is_enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RateLimitPolicyCreate(BaseModel):
+    target_type: str = "CATEGORY"
+    target_id: str
+    max_requests: int = 10
+    window_seconds: int = 60
+    is_enabled: bool = True
+
+
+class RateLimitPolicyUpdate(BaseModel):
+    max_requests: Optional[int] = None
+    window_seconds: Optional[int] = None
+    is_enabled: Optional[bool] = None
+
+
+class RateLimitPolicyResponse(BaseModel):
+    id: int
+    target_type: str
+    target_id: str
+    max_requests: int
+    window_seconds: int
+    is_enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -198,3 +266,332 @@ async def sweep_dead_jobs(db: AsyncSession = Depends(get_db)):
         "recovered_ids": recovered_ids,
         "reconciliation": reconciliation.as_dict() if reconciliation else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Concurrency Limit Policy API
+# ---------------------------------------------------------------------------
+@app.post(
+    "/policies/concurrency",
+    response_model=ConcurrencyPolicyResponse,
+    status_code=200,
+)
+@app.post(
+    "/policies/concurrency/",
+    response_model=ConcurrencyPolicyResponse,
+    status_code=200,
+    include_in_schema=False,
+)
+async def create_or_upsert_concurrency_policy(
+    payload: ConcurrencyPolicyCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        policy = await set_concurrency_limit_policy(
+            session=db,
+            target_type=payload.target_type,
+            target_id=payload.target_id,
+            max_concurrency=payload.max_concurrency,
+            is_enabled=payload.is_enabled,
+        )
+        await db.commit()
+        await db.refresh(policy)
+        return policy
+    except PolicyValidationError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.get(
+    "/policies/concurrency",
+    response_model=list[ConcurrencyPolicyResponse],
+)
+@app.get(
+    "/policies/concurrency/",
+    response_model=list[ConcurrencyPolicyResponse],
+    include_in_schema=False,
+)
+async def list_concurrency_policies(
+    target_type: Optional[str] = None,
+    target_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    return await list_concurrency_limit_policies(
+        session=db,
+        target_type=target_type,
+        target_id=target_id,
+    )
+
+
+@app.get(
+    "/policies/concurrency/target/{target_type}/{target_id}",
+    response_model=ConcurrencyPolicyResponse,
+)
+async def get_concurrency_policy_by_target(
+    target_type: str,
+    target_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    policy = await get_concurrency_limit_policy(
+        session=db, target_type=target_type, target_id=target_id
+    )
+    if not policy:
+        raise HTTPException(status_code=404, detail="Concurrency policy not found")
+    return policy
+
+
+@app.get(
+    "/policies/concurrency/{policy_id}",
+    response_model=ConcurrencyPolicyResponse,
+)
+async def get_concurrency_policy(
+    policy_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    policy = await get_concurrency_limit_policy_by_id(session=db, policy_id=policy_id)
+    if not policy:
+        raise HTTPException(status_code=404, detail="Concurrency policy not found")
+    return policy
+
+
+@app.patch(
+    "/policies/concurrency/{policy_id}",
+    response_model=ConcurrencyPolicyResponse,
+)
+@app.put(
+    "/policies/concurrency/{policy_id}",
+    response_model=ConcurrencyPolicyResponse,
+    include_in_schema=False,
+)
+async def update_concurrency_policy(
+    policy_id: int,
+    payload: ConcurrencyPolicyUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        policy = await update_concurrency_limit_policy(
+            session=db,
+            policy_id=policy_id,
+            max_concurrency=payload.max_concurrency,
+            is_enabled=payload.is_enabled,
+        )
+        if not policy:
+            raise HTTPException(status_code=404, detail="Concurrency policy not found")
+        await db.commit()
+        await db.refresh(policy)
+        return policy
+    except PolicyValidationError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.post(
+    "/policies/concurrency/{policy_id}/enable",
+    response_model=ConcurrencyPolicyResponse,
+)
+async def enable_concurrency_policy(
+    policy_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    policy = await set_concurrency_limit_policy_enabled(
+        session=db, policy_id=policy_id, is_enabled=True
+    )
+    if not policy:
+        raise HTTPException(status_code=404, detail="Concurrency policy not found")
+    await db.commit()
+    await db.refresh(policy)
+    return policy
+
+
+@app.post(
+    "/policies/concurrency/{policy_id}/disable",
+    response_model=ConcurrencyPolicyResponse,
+)
+async def disable_concurrency_policy(
+    policy_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    policy = await set_concurrency_limit_policy_enabled(
+        session=db, policy_id=policy_id, is_enabled=False
+    )
+    if not policy:
+        raise HTTPException(status_code=404, detail="Concurrency policy not found")
+    await db.commit()
+    await db.refresh(policy)
+    return policy
+
+
+@app.delete("/policies/concurrency/{policy_id}")
+async def delete_concurrency_policy(
+    policy_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    deleted = await delete_concurrency_limit_policy(session=db, policy_id=policy_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Concurrency policy not found")
+    await db.commit()
+    return {"message": "Concurrency policy deleted", "id": policy_id}
+
+
+# ---------------------------------------------------------------------------
+# Rate Limit Policy API
+# ---------------------------------------------------------------------------
+@app.post(
+    "/policies/rate-limit",
+    response_model=RateLimitPolicyResponse,
+    status_code=200,
+)
+@app.post(
+    "/policies/rate-limit/",
+    response_model=RateLimitPolicyResponse,
+    status_code=200,
+    include_in_schema=False,
+)
+async def create_or_upsert_rate_limit_policy(
+    payload: RateLimitPolicyCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        policy = await set_rate_limit_policy(
+            session=db,
+            target_type=payload.target_type,
+            target_id=payload.target_id,
+            max_requests=payload.max_requests,
+            window_seconds=payload.window_seconds,
+            is_enabled=payload.is_enabled,
+        )
+        await db.commit()
+        await db.refresh(policy)
+        return policy
+    except PolicyValidationError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.get(
+    "/policies/rate-limit",
+    response_model=list[RateLimitPolicyResponse],
+)
+@app.get(
+    "/policies/rate-limit/",
+    response_model=list[RateLimitPolicyResponse],
+    include_in_schema=False,
+)
+async def list_rate_limit_policies_route(
+    target_type: Optional[str] = None,
+    target_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    return await list_rate_limit_policies(
+        session=db,
+        target_type=target_type,
+        target_id=target_id,
+    )
+
+
+@app.get(
+    "/policies/rate-limit/target/{target_type}/{target_id}",
+    response_model=RateLimitPolicyResponse,
+)
+async def get_rate_limit_policy_by_target(
+    target_type: str,
+    target_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    policy = await get_rate_limit_policy(
+        session=db, target_type=target_type, target_id=target_id
+    )
+    if not policy:
+        raise HTTPException(status_code=404, detail="Rate limit policy not found")
+    return policy
+
+
+@app.get(
+    "/policies/rate-limit/{policy_id}",
+    response_model=RateLimitPolicyResponse,
+)
+async def get_rate_limit_policy_route(
+    policy_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    policy = await get_rate_limit_policy_by_id(session=db, policy_id=policy_id)
+    if not policy:
+        raise HTTPException(status_code=404, detail="Rate limit policy not found")
+    return policy
+
+
+@app.patch(
+    "/policies/rate-limit/{policy_id}",
+    response_model=RateLimitPolicyResponse,
+)
+@app.put(
+    "/policies/rate-limit/{policy_id}",
+    response_model=RateLimitPolicyResponse,
+    include_in_schema=False,
+)
+async def update_rate_limit_policy_route(
+    policy_id: int,
+    payload: RateLimitPolicyUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        policy = await update_rate_limit_policy(
+            session=db,
+            policy_id=policy_id,
+            max_requests=payload.max_requests,
+            window_seconds=payload.window_seconds,
+            is_enabled=payload.is_enabled,
+        )
+        if not policy:
+            raise HTTPException(status_code=404, detail="Rate limit policy not found")
+        await db.commit()
+        await db.refresh(policy)
+        return policy
+    except PolicyValidationError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.post(
+    "/policies/rate-limit/{policy_id}/enable",
+    response_model=RateLimitPolicyResponse,
+)
+async def enable_rate_limit_policy(
+    policy_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    policy = await set_rate_limit_policy_enabled(
+        session=db, policy_id=policy_id, is_enabled=True
+    )
+    if not policy:
+        raise HTTPException(status_code=404, detail="Rate limit policy not found")
+    await db.commit()
+    await db.refresh(policy)
+    return policy
+
+
+@app.post(
+    "/policies/rate-limit/{policy_id}/disable",
+    response_model=RateLimitPolicyResponse,
+)
+async def disable_rate_limit_policy(
+    policy_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    policy = await set_rate_limit_policy_enabled(
+        session=db, policy_id=policy_id, is_enabled=False
+    )
+    if not policy:
+        raise HTTPException(status_code=404, detail="Rate limit policy not found")
+    await db.commit()
+    await db.refresh(policy)
+    return policy
+
+
+@app.delete("/policies/rate-limit/{policy_id}")
+async def delete_rate_limit_policy_route(
+    policy_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    deleted = await delete_rate_limit_policy(session=db, policy_id=policy_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Rate limit policy not found")
+    await db.commit()
+    return {"message": "Rate limit policy deleted", "id": policy_id}
+

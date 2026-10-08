@@ -166,6 +166,83 @@ async def get_concurrency_limit_policy(
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
+async def get_concurrency_limit_policy_by_id(
+    session: AsyncSession,
+    policy_id: int,
+) -> ConcurrencyLimitPolicy | None:
+    """Retrieve an existing concurrency limit policy by primary key id."""
+    return await session.get(ConcurrencyLimitPolicy, policy_id)
+
+
+async def list_concurrency_limit_policies(
+    session: AsyncSession,
+    target_type: str | None = None,
+    target_id: str | int | None = None,
+) -> list[ConcurrencyLimitPolicy]:
+    """List concurrency limit policies, optionally filtered by target type and target id."""
+    stmt = select(ConcurrencyLimitPolicy)
+    if target_type is not None:
+        stmt = stmt.where(
+            ConcurrencyLimitPolicy.target_type == target_type.strip().upper()
+        )
+    if target_id is not None:
+        stmt = stmt.where(
+            ConcurrencyLimitPolicy.target_id == str(target_id).strip()
+        )
+    stmt = stmt.order_by(ConcurrencyLimitPolicy.id.asc())
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def update_concurrency_limit_policy(
+    session: AsyncSession,
+    policy_id: int,
+    max_concurrency: int | None = None,
+    is_enabled: bool | None = None,
+) -> ConcurrencyLimitPolicy | None:
+    """Update max_concurrency and/or is_enabled on an existing concurrency limit policy."""
+    policy = await session.get(ConcurrencyLimitPolicy, policy_id)
+    if not policy:
+        return None
+
+    if max_concurrency is not None:
+        if not isinstance(max_concurrency, int) or max_concurrency < 1:
+            raise PolicyValidationError(
+                f"max_concurrency must be an integer >= 1, got {max_concurrency}"
+            )
+        policy.max_concurrency = max_concurrency
+
+    if is_enabled is not None:
+        policy.is_enabled = bool(is_enabled)
+
+    await session.flush()
+    return policy
+
+
+async def set_concurrency_limit_policy_enabled(
+    session: AsyncSession,
+    policy_id: int,
+    is_enabled: bool,
+) -> ConcurrencyLimitPolicy | None:
+    """Enable or disable an existing concurrency limit policy."""
+    return await update_concurrency_limit_policy(
+        session, policy_id, is_enabled=is_enabled
+    )
+
+
+async def delete_concurrency_limit_policy(
+    session: AsyncSession,
+    policy_id: int,
+) -> bool:
+    """Delete a concurrency limit policy by id. Returns True if deleted, False if not found."""
+    policy = await session.get(ConcurrencyLimitPolicy, policy_id)
+    if not policy:
+        return False
+    await session.delete(policy)
+    await session.flush()
+    return True
+
+
 async def set_rate_limit_policy(
     session: AsyncSession,
     target_type: str,
@@ -215,6 +292,89 @@ async def get_rate_limit_policy(
         RateLimitPolicy.target_id == t_id_str,
     )
     return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def get_rate_limit_policy_by_id(
+    session: AsyncSession,
+    policy_id: int,
+) -> RateLimitPolicy | None:
+    """Retrieve an existing rate limit policy by primary key id."""
+    return await session.get(RateLimitPolicy, policy_id)
+
+
+async def list_rate_limit_policies(
+    session: AsyncSession,
+    target_type: str | None = None,
+    target_id: str | int | None = None,
+) -> list[RateLimitPolicy]:
+    """List rate limit policies, optionally filtered by target type and target id."""
+    stmt = select(RateLimitPolicy)
+    if target_type is not None:
+        stmt = stmt.where(
+            RateLimitPolicy.target_type == target_type.strip().upper()
+        )
+    if target_id is not None:
+        stmt = stmt.where(RateLimitPolicy.target_id == str(target_id).strip())
+    stmt = stmt.order_by(RateLimitPolicy.id.asc())
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def update_rate_limit_policy(
+    session: AsyncSession,
+    policy_id: int,
+    max_requests: int | None = None,
+    window_seconds: int | None = None,
+    is_enabled: bool | None = None,
+) -> RateLimitPolicy | None:
+    """Update max_requests, window_seconds, and/or is_enabled on an existing rate limit policy."""
+    policy = await session.get(RateLimitPolicy, policy_id)
+    if not policy:
+        return None
+
+    if max_requests is not None:
+        if not isinstance(max_requests, int) or max_requests < 1:
+            raise PolicyValidationError(
+                f"max_requests must be an integer >= 1, got {max_requests}"
+            )
+        policy.max_requests = max_requests
+
+    if window_seconds is not None:
+        if not isinstance(window_seconds, int) or window_seconds < 1:
+            raise PolicyValidationError(
+                f"window_seconds must be an integer >= 1, got {window_seconds}"
+            )
+        policy.window_seconds = window_seconds
+
+    if is_enabled is not None:
+        policy.is_enabled = bool(is_enabled)
+
+    await session.flush()
+    return policy
+
+
+async def set_rate_limit_policy_enabled(
+    session: AsyncSession,
+    policy_id: int,
+    is_enabled: bool,
+) -> RateLimitPolicy | None:
+    """Enable or disable an existing rate limit policy."""
+    return await update_rate_limit_policy(
+        session, policy_id, is_enabled=is_enabled
+    )
+
+
+async def delete_rate_limit_policy(
+    session: AsyncSession,
+    policy_id: int,
+) -> bool:
+    """Delete a rate limit policy by id. Returns True if deleted, False if not found."""
+    policy = await session.get(RateLimitPolicy, policy_id)
+    if not policy:
+        return False
+    await session.delete(policy)
+    await session.flush()
+    return True
 
 
 async def resolve_execution_context(
