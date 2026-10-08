@@ -40,7 +40,7 @@ async def heartbeat_forever(worker_id):
         except Exception as error:
             print(f"Worker heartbeat failed for {worker_id}: {error}")
 
-async def claim_and_run(execution_id, worker_id=WORKER_ID):
+async def claim_and_run(execution_id, worker_id=WORKER_ID, redis_conn=None):
     async with AsyncSessionLocal() as session:
         claim = await claim_execution(
             session,
@@ -66,7 +66,7 @@ async def claim_and_run(execution_id, worker_id=WORKER_ID):
         await asyncio.sleep(30)
 
         print(f"<<< Finished execution {execution_id}!")
-        if not await complete_execution(session, claim):
+        if not await complete_execution(session, claim, redis_client=redis_conn):
             print(f"Execution {execution_id} is no longer owned by {worker_id}; not completing it.")
 
 
@@ -87,7 +87,7 @@ async def run_worker(redis_conn):
                 queue_name, execution_id = job
                 print(f"\n--- INCOMING WORK ---")
                 print(f"Got a job from Redis! Execution ID: {execution_id}")
-                await claim_and_run(execution_id)
+                await claim_and_run(execution_id, redis_conn=redis_conn)
     finally:
         heartbeat_task.cancel()
         with suppress(asyncio.CancelledError):

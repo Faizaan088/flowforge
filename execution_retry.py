@@ -52,6 +52,7 @@ async def transition_failed_execution(
     backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
     max_delay: timedelta | None = None,
     retry_delay: timedelta | None = None,
+    redis_client=None,
 ) -> str | None:
     """Evaluate a FAILED execution: move to RETRY_WAIT if retryable, or DEAD_LETTERED if exhausted.
 
@@ -91,7 +92,15 @@ async def transition_failed_execution(
             row.status = "DEAD_LETTERED"
             row.available_at = None
             row.finished_at = current_time
-            return "DEAD_LETTERED"
+            outcome = "DEAD_LETTERED"
+
+    if outcome == "DEAD_LETTERED":
+        from workflow_engine import advance_workflow_on_execution_terminal
+        await advance_workflow_on_execution_terminal(
+            session, int(execution_id), redis_client=redis_client
+        )
+
+    return outcome
 
 
 async def process_failed_executions(
@@ -101,6 +110,7 @@ async def process_failed_executions(
     backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
     max_delay: timedelta | None = None,
     retry_delay: timedelta | None = None,
+    redis_client=None,
 ) -> dict[str, list[int]]:
     """Partition all FAILED executions into RETRY_WAIT or DEAD_LETTERED atomically."""
     current_time = now or datetime.now(timezone.utc)
@@ -144,6 +154,13 @@ async def process_failed_executions(
                 row.available_at = None
                 row.finished_at = current_time
                 dead_lettered_ids.append(row.id)
+
+    if dead_lettered_ids:
+        from workflow_engine import advance_workflow_on_execution_terminal
+        for dead_id in dead_lettered_ids:
+            await advance_workflow_on_execution_terminal(
+                session, dead_id, redis_client=redis_client
+            )
 
     return {
         "retry_wait": retry_wait_ids,
@@ -226,9 +243,10 @@ async def fail_and_evaluate_retry(
     backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
     max_delay: timedelta | None = None,
     retry_delay: timedelta | None = None,
+    redis_client=None,
 ) -> str | None:
     """Transition RUNNING -> FAILED -> RETRY_WAIT or DEAD_LETTERED for an owned claim."""
-    failed = await fail_execution(session, claim, error_summary=error_summary)
+    failed = await fail_execution(session, claim, error_summary=error_summary, redis_client=redis_client)
     if not failed:
         return None
     return await transition_failed_execution(
@@ -240,4 +258,5 @@ async def fail_and_evaluate_retry(
         backoff_factor=backoff_factor,
         max_delay=max_delay,
         retry_delay=retry_delay,
+        redis_client=redis_client,
     )

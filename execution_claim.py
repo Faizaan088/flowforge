@@ -85,6 +85,7 @@ async def start_execution(
 async def complete_execution(
     session: AsyncSession,
     claim: ExecutionClaim,
+    redis_client=None,
 ) -> bool:
     """Mark an execution successful only when the original claim still owns it."""
     async with session.begin():
@@ -103,13 +104,23 @@ async def complete_execution(
             )
             .returning(Execution.id)
         )
-        return result.scalar_one_or_none() is not None
+        succeeded = result.scalar_one_or_none() is not None
+
+    if not succeeded:
+        return False
+
+    from workflow_engine import advance_workflow_on_execution_terminal
+    await advance_workflow_on_execution_terminal(
+        session, claim.execution_id, redis_client=redis_client
+    )
+    return True
 
 
 async def fail_execution(
     session: AsyncSession,
     claim: ExecutionClaim,
     error_summary: str | None = None,
+    redis_client=None,
 ) -> bool:
     """Mark an execution failed only when the original claim still owns it."""
     async with session.begin():
