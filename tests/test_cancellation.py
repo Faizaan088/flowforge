@@ -45,7 +45,9 @@ if TEST_DATABASE_URL:
         WorkflowRun,
         WorkflowTask,
         WorkflowTaskExecution,
+        User,
     )
+    from auth import get_current_user
     from tests.test_policy_api import AsyncApiClient
     from workflow_engine import (
         cancel_workflow_run,
@@ -92,11 +94,18 @@ async def client(session_factory):
         async with session_factory() as session:
             yield session
 
+    admin_user = User(id=1, username="test-admin", role="admin", is_active=True)
+
+    async def get_test_user():
+        return admin_user
+
     app.dependency_overrides[get_db] = get_test_db
+    app.dependency_overrides[get_current_user] = get_test_user
     try:
         yield AsyncApiClient(app)
     finally:
         app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
 
 
 # ===========================================================================

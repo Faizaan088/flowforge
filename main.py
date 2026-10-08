@@ -40,6 +40,21 @@ from queue_reconciliation import (
     reconcile_queued_executions,
 )
 from workflow_engine import WorkflowValidationError, cancel_workflow_run
+from auth import (
+    LoginRequest,
+    TokenResponse,
+    UserAlreadyExistsError,
+    UserCreate,
+    UserResponse,
+    authenticate_user,
+    bootstrap_admin,
+    create_access_token,
+    create_user,
+    get_current_user,
+    list_users,
+    require_permission,
+    require_role,
+)
 
 
 RECOVERY_INTERVAL_SECONDS = float(
@@ -130,6 +145,7 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     async with AsyncSessionLocal() as session:
+        await bootstrap_admin(session)
         reconciliation = await reconcile_queue(session)
         if reconciliation is not None:
             print(f"Startup queue reconciliation: {reconciliation.as_dict()}")
@@ -222,8 +238,83 @@ async def recovery_loop(
 async def health_check():
     return {"status": "healthy"}
 
+
+# ---------------------------------------------------------------------------
+# Authentication & User Management API
+# ---------------------------------------------------------------------------
+@app.post("/auth/login", response_model=TokenResponse)
+async def login(
+    payload: LoginRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    user = await authenticate_user(db, payload.username, payload.password)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not user.is_active:
+        raise HTTPException(
+            status_code=401,
+            detail="User account is disabled",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = create_access_token(user)
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        user=UserResponse.model_validate(user),
+    )
+
+
+@app.get("/auth/me", response_model=UserResponse)
+async def get_me(
+    current_user: models.User = Depends(get_current_user),
+):
+    return current_user
+
+
+@app.post("/auth/users", response_model=UserResponse, status_code=201)
+async def create_user_route(
+    payload: UserCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("users:manage")),
+):
+    try:
+        user = await create_user(
+            session=db,
+            username=payload.username,
+            password=payload.password,
+            role=payload.role,
+            email=payload.email,
+        )
+        await db.commit()
+        await db.refresh(user)
+        return user
+    except UserAlreadyExistsError as err:
+        raise HTTPException(status_code=409, detail=str(err))
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.get("/auth/users", response_model=list[UserResponse])
+async def list_users_route(
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("users:manage")),
+):
+    return await list_users(db)
+
+
+# ---------------------------------------------------------------------------
+# Jobs & Executions API (Protected by RBAC)
+# ---------------------------------------------------------------------------
 @app.post("/jobs/")
-async def create_job(job: JobCreate, db: AsyncSession = Depends(get_db)):
+async def create_job(
+    job: JobCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:trigger")),
+):
     new_job = models.JobDefinition(
         name=job.name, 
         payload=job.payload, 
@@ -239,6 +330,7 @@ async def trigger_job(
     job_id: int,
     payload: Optional[ExecutionTrigger] = None,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:trigger")),
 ):
     result = await db.execute(select(models.JobDefinition).where(models.JobDefinition.id == job_id))
     job = result.scalar_one_or_none()
@@ -271,13 +363,20 @@ async def trigger_job(
 
 
 @app.get("/executions/")
-async def list_executions(db: AsyncSession = Depends(get_db)):
+async def list_executions(
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:read")),
+):
     result = await db.execute(select(models.Execution).order_by(models.Execution.priority.desc(), models.Execution.id.asc()))
     return result.scalars().all()
 
 
 @app.get("/executions/{execution_id}")
-async def get_execution(execution_id: int, db: AsyncSession = Depends(get_db)):
+async def get_execution(
+    execution_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:read")),
+):
     execution = await db.get(models.Execution, execution_id)
     if not execution:
         raise HTTPException(status_code=404, detail="Execution not found")
@@ -289,6 +388,7 @@ async def cancel_execution_route(
     execution_id: int,
     payload: Optional[ExecutionCancelRequest] = None,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:cancel")),
 ):
     r_url = os.getenv("REDIS_URL")
     redis_client = redis.from_url(r_url, decode_responses=True) if r_url else None
@@ -319,6 +419,7 @@ async def update_execution_priority_route(
     execution_id: int,
     payload: ExecutionPriorityUpdate,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:priority")),
 ):
     row = await db.get(models.Execution, execution_id)
     if not row:
@@ -339,6 +440,7 @@ async def cancel_workflow_run_route(
     run_id: int,
     payload: Optional[WorkflowCancelRequest] = None,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("workflows:manage")),
 ):
     r_url = os.getenv("REDIS_URL")
     redis_client = redis.from_url(r_url, decode_responses=True) if r_url else None
@@ -360,14 +462,20 @@ async def cancel_workflow_run_route(
 
 
 @app.post("/system/reconcile-queue")
-async def reconcile_execution_queue(db: AsyncSession = Depends(get_db)):
+async def reconcile_execution_queue(
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("system:reconcile")),
+):
     reconciliation = await reconcile_queue(db)
     if reconciliation is None:
         raise HTTPException(status_code=503, detail="Redis is not configured")
     return reconciliation.as_dict()
 
 @app.post("/system/sweep")
-async def sweep_dead_jobs(db: AsyncSession = Depends(get_db)):
+async def sweep_dead_jobs(
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("system:reconcile")),
+):
     recovered_ids = await recover_expired_executions(db)
     if not recovered_ids:
         return {"message": "All clean! No dead jobs found."}
@@ -381,7 +489,7 @@ async def sweep_dead_jobs(db: AsyncSession = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# Concurrency Limit Policy API
+# Concurrency Limit Policy API (Protected by RBAC)
 # ---------------------------------------------------------------------------
 @app.post(
     "/policies/concurrency",
@@ -397,6 +505,7 @@ async def sweep_dead_jobs(db: AsyncSession = Depends(get_db)):
 async def create_or_upsert_concurrency_policy(
     payload: ConcurrencyPolicyCreate,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:manage")),
 ):
     try:
         policy = await set_concurrency_limit_policy(
@@ -426,6 +535,7 @@ async def list_concurrency_policies(
     target_type: Optional[str] = None,
     target_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:read")),
 ):
     return await list_concurrency_limit_policies(
         session=db,
@@ -442,6 +552,7 @@ async def get_concurrency_policy_by_target(
     target_type: str,
     target_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:read")),
 ):
     policy = await get_concurrency_limit_policy(
         session=db, target_type=target_type, target_id=target_id
@@ -458,6 +569,7 @@ async def get_concurrency_policy_by_target(
 async def get_concurrency_policy(
     policy_id: int,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:read")),
 ):
     policy = await get_concurrency_limit_policy_by_id(session=db, policy_id=policy_id)
     if not policy:
@@ -478,6 +590,7 @@ async def update_concurrency_policy(
     policy_id: int,
     payload: ConcurrencyPolicyUpdate,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:manage")),
 ):
     try:
         policy = await update_concurrency_limit_policy(
@@ -502,6 +615,7 @@ async def update_concurrency_policy(
 async def enable_concurrency_policy(
     policy_id: int,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:manage")),
 ):
     policy = await set_concurrency_limit_policy_enabled(
         session=db, policy_id=policy_id, is_enabled=True
@@ -520,6 +634,7 @@ async def enable_concurrency_policy(
 async def disable_concurrency_policy(
     policy_id: int,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:manage")),
 ):
     policy = await set_concurrency_limit_policy_enabled(
         session=db, policy_id=policy_id, is_enabled=False
@@ -535,6 +650,7 @@ async def disable_concurrency_policy(
 async def delete_concurrency_policy(
     policy_id: int,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:manage")),
 ):
     deleted = await delete_concurrency_limit_policy(session=db, policy_id=policy_id)
     if not deleted:
@@ -544,7 +660,7 @@ async def delete_concurrency_policy(
 
 
 # ---------------------------------------------------------------------------
-# Rate Limit Policy API
+# Rate Limit Policy API (Protected by RBAC)
 # ---------------------------------------------------------------------------
 @app.post(
     "/policies/rate-limit",
@@ -560,6 +676,7 @@ async def delete_concurrency_policy(
 async def create_or_upsert_rate_limit_policy(
     payload: RateLimitPolicyCreate,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:manage")),
 ):
     try:
         policy = await set_rate_limit_policy(
@@ -590,6 +707,7 @@ async def list_rate_limit_policies_route(
     target_type: Optional[str] = None,
     target_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:read")),
 ):
     return await list_rate_limit_policies(
         session=db,
@@ -606,6 +724,7 @@ async def get_rate_limit_policy_by_target(
     target_type: str,
     target_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:read")),
 ):
     policy = await get_rate_limit_policy(
         session=db, target_type=target_type, target_id=target_id
@@ -622,6 +741,7 @@ async def get_rate_limit_policy_by_target(
 async def get_rate_limit_policy_route(
     policy_id: int,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:read")),
 ):
     policy = await get_rate_limit_policy_by_id(session=db, policy_id=policy_id)
     if not policy:
@@ -642,6 +762,7 @@ async def update_rate_limit_policy_route(
     policy_id: int,
     payload: RateLimitPolicyUpdate,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:manage")),
 ):
     try:
         policy = await update_rate_limit_policy(
@@ -667,6 +788,7 @@ async def update_rate_limit_policy_route(
 async def enable_rate_limit_policy(
     policy_id: int,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:manage")),
 ):
     policy = await set_rate_limit_policy_enabled(
         session=db, policy_id=policy_id, is_enabled=True
@@ -685,6 +807,7 @@ async def enable_rate_limit_policy(
 async def disable_rate_limit_policy(
     policy_id: int,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:manage")),
 ):
     policy = await set_rate_limit_policy_enabled(
         session=db, policy_id=policy_id, is_enabled=False
@@ -700,10 +823,12 @@ async def disable_rate_limit_policy(
 async def delete_rate_limit_policy_route(
     policy_id: int,
     db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:manage")),
 ):
     deleted = await delete_rate_limit_policy(session=db, policy_id=policy_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Rate limit policy not found")
     await db.commit()
     return {"message": "Rate limit policy deleted", "id": policy_id}
+
 
