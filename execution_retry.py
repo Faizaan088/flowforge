@@ -7,6 +7,7 @@ RETRY_WAIT -> QUEUED when eligible (available_at is None or available_at <= now)
 """
 
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, or_, select, update
@@ -14,6 +15,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from execution_claim import ExecutionClaim, fail_execution
 from models import Execution
+
+
+@asynccontextmanager
+async def _atomic_session(session: AsyncSession):
+    """Ensure atomic transaction execution whether session is already in a transaction or not."""
+    if session.in_transaction():
+        yield session
+        await session.flush()
+    else:
+        async with session.begin():
+            yield session
 
 
 DEFAULT_MAX_RETRIES = 3
@@ -66,7 +78,7 @@ async def transition_failed_execution(
         else (retry_delay if retry_delay is not None else DEFAULT_BASE_DELAY)
     )
 
-    async with session.begin():
+    async with _atomic_session(session):
         row = await session.get(Execution, int(execution_id), with_for_update=True)
         if row is None or row.status != "FAILED":
             return None
@@ -154,7 +166,7 @@ async def process_failed_executions(
         else (retry_delay if retry_delay is not None else DEFAULT_BASE_DELAY)
     )
 
-    async with session.begin():
+    async with _atomic_session(session):
         result = await session.execute(
             select(Execution)
             .where(Execution.status == "FAILED")
@@ -213,7 +225,7 @@ async def requeue_retry_execution(
     """
     requeue_time = now or datetime.now(timezone.utc)
 
-    async with session.begin():
+    async with _atomic_session(session):
         result = await session.execute(
             update(Execution)
             .where(
@@ -244,7 +256,7 @@ async def requeue_eligible_retries(
     """Transition all eligible RETRY_WAIT executions back to QUEUED."""
     requeue_time = now or datetime.now(timezone.utc)
 
-    async with session.begin():
+    async with _atomic_session(session):
         result = await session.execute(
             update(Execution)
             .where(

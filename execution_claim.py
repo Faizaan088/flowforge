@@ -191,7 +191,7 @@ async def start_execution(
     redis_client=None,
 ) -> bool:
     """Transition an execution to RUNNING only for its exact claim owner."""
-    async with session.begin():
+    async with _atomic_session(session):
         result = await session.execute(
             update(Execution)
             .where(
@@ -228,7 +228,7 @@ async def complete_execution(
     redis_client=None,
 ) -> bool:
     """Mark an execution successful only when the original claim still owns it."""
-    async with session.begin():
+    async with _atomic_session(session):
         result = await session.execute(
             update(Execution)
             .where(
@@ -278,7 +278,7 @@ async def fail_execution(
     redis_client=None,
 ) -> bool:
     """Mark an execution failed only when the original claim still owns it."""
-    async with session.begin():
+    async with _atomic_session(session):
         result = await session.execute(
             update(Execution)
             .where(
