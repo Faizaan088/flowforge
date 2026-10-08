@@ -29,7 +29,7 @@ if TEST_DATABASE_URL:
         complete_execution,
         start_execution,
     )
-    from models import Execution, Worker  # noqa: E402
+    from models import Execution, RateLimitPolicy, RateLimitRecord, Worker  # noqa: E402
     from queue_reconciliation import ReconciliationResult  # noqa: E402
     from worker_registry import (  # noqa: E402
         heartbeat_worker,
@@ -68,6 +68,8 @@ async def session_factory():
 @pytest_asyncio.fixture(autouse=True)
 async def clear_database(session_factory):
     async with session_factory() as session:
+        await session.execute(RateLimitRecord.__table__.delete())
+        await session.execute(RateLimitPolicy.__table__.delete())
         await session.execute(Execution.__table__.delete())
         await session.execute(Worker.__table__.delete())
         await session.commit()
@@ -492,4 +494,149 @@ async def test_recovery_cycle_handles_both_expired_leases_and_eligible_retries(
         assert retry_row.worker_id is None
         assert retry_row.available_at is None
         assert retry_row.attempt == 2
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_cleanup_cycle_removes_expired_records(
+    session_factory, monkeypatch
+):
+    """Rate limit cleanup removes records older than retention buffer and preserves recent ones."""
+    base_time = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
+    policy = RateLimitPolicy(
+        target_type="CATEGORY",
+        target_id="cleanup-test",
+        max_requests=10,
+        window_seconds=60,
+        is_enabled=True,
+    )
+    async with session_factory() as session:
+        session.add(policy)
+        await session.commit()
+        await session.refresh(policy)
+        policy_id = policy.id
+
+        # 3 expired records (older than 1h buffer)
+        expired_records = [
+            RateLimitRecord(
+                policy_id=policy_id,
+                recorded_at=base_time - timedelta(seconds=3600 + i * 10),
+            )
+            for i in range(1, 4)
+        ]
+        # 2 active records (within buffer)
+        active_records = [
+            RateLimitRecord(
+                policy_id=policy_id,
+                recorded_at=base_time - timedelta(seconds=100 + i * 10),
+            )
+            for i in range(1, 3)
+        ]
+        session.add_all(expired_records + active_records)
+        await session.commit()
+
+    monkeypatch.setattr(main, "AsyncSessionLocal", session_factory)
+
+    deleted_count = await main.run_rate_limit_cleanup_cycle(
+        now=base_time, buffer_seconds=3600
+    )
+    assert deleted_count == 3
+
+    async with session_factory() as session:
+        remaining = (
+            await session.execute(
+                select(RateLimitRecord).where(RateLimitRecord.policy_id == policy_id)
+            )
+        ).scalars().all()
+        assert len(remaining) == 2
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_cleanup_cycle_failure_is_bounded_and_safe(
+    session_factory, monkeypatch
+):
+    """Failure during rate limit cleanup does not raise and safely returns 0."""
+    monkeypatch.setattr(main, "AsyncSessionLocal", session_factory)
+
+    async def exploding_cleanup(*args, **kwargs):
+        raise RuntimeError("Database connection lost during cleanup")
+
+    monkeypatch.setattr(
+        main, "cleanup_expired_rate_limit_records", exploding_cleanup
+    )
+
+    deleted_count = await main.run_rate_limit_cleanup_cycle()
+    assert deleted_count == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_loop_periodically_invokes_cleanup(monkeypatch):
+    """Recovery loop periodically invokes both recovery cycle and rate limit cleanup."""
+    recovery_cycles = 0
+    cleanup_cycles = 0
+    target_reached = asyncio.Event()
+
+    async def fake_recovery_cycle(*args, **kwargs):
+        nonlocal recovery_cycles
+        recovery_cycles += 1
+        if recovery_cycles >= 2 and cleanup_cycles >= 2:
+            target_reached.set()
+        return [], None
+
+    async def fake_cleanup_cycle(*args, **kwargs):
+        nonlocal cleanup_cycles
+        cleanup_cycles += 1
+        if recovery_cycles >= 2 and cleanup_cycles >= 2:
+            target_reached.set()
+        return 0
+
+    monkeypatch.setattr(main, "run_recovery_cycle", fake_recovery_cycle)
+    monkeypatch.setattr(main, "run_rate_limit_cleanup_cycle", fake_cleanup_cycle)
+
+    task = asyncio.create_task(
+        main.recovery_loop(interval_seconds=0.01, cleanup_interval_seconds=0.01)
+    )
+
+    try:
+        await asyncio.wait_for(target_reached.wait(), timeout=2.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert recovery_cycles >= 2
+    assert cleanup_cycles >= 2
+
+
+@pytest.mark.asyncio
+async def test_recovery_loop_cleanup_failure_does_not_halt_recovery(monkeypatch):
+    """An unhandled error in rate limit cleanup does not halt background recovery loop."""
+    recovery_cycles = 0
+    target_reached = asyncio.Event()
+
+    async def fake_recovery_cycle(*args, **kwargs):
+        nonlocal recovery_cycles
+        recovery_cycles += 1
+        if recovery_cycles >= 3:
+            target_reached.set()
+        return [], None
+
+    async def failing_cleanup_cycle(*args, **kwargs):
+        raise RuntimeError("Unexpected cleanup failure in loop")
+
+    monkeypatch.setattr(main, "run_recovery_cycle", fake_recovery_cycle)
+    monkeypatch.setattr(main, "run_rate_limit_cleanup_cycle", failing_cleanup_cycle)
+
+    task = asyncio.create_task(
+        main.recovery_loop(interval_seconds=0.01, cleanup_interval_seconds=0.01)
+    )
+
+    try:
+        await asyncio.wait_for(target_reached.wait(), timeout=2.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert recovery_cycles >= 3
+
 

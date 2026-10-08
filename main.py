@@ -13,6 +13,7 @@ from sqlalchemy.future import select
 
 from database import engine, Base, get_db, AsyncSessionLocal
 import models 
+from concurrency_policy import cleanup_expired_rate_limit_records
 from execution_recovery import recover_expired_executions
 from execution_retry import requeue_eligible_retries
 from queue_reconciliation import (
@@ -24,6 +25,12 @@ from queue_reconciliation import (
 
 RECOVERY_INTERVAL_SECONDS = float(
     os.getenv("EXECUTION_RECOVERY_INTERVAL_SECONDS", "10")
+)
+RATE_LIMIT_CLEANUP_INTERVAL_SECONDS = float(
+    os.getenv("RATE_LIMIT_CLEANUP_INTERVAL_SECONDS", "60")
+)
+RATE_LIMIT_RETENTION_BUFFER_SECONDS = int(
+    os.getenv("RATE_LIMIT_RETENTION_BUFFER_SECONDS", "3600")
 )
 
 class JobCreate(BaseModel):
@@ -79,7 +86,29 @@ async def run_recovery_cycle(now: Optional[datetime] = None):
     return requeued_ids, reconciliation
 
 
-async def recovery_loop(interval_seconds: float = RECOVERY_INTERVAL_SECONDS):
+async def run_rate_limit_cleanup_cycle(
+    now: Optional[datetime] = None,
+    buffer_seconds: int = RATE_LIMIT_RETENTION_BUFFER_SECONDS,
+) -> int:
+    current_time = now or datetime.now(timezone.utc)
+    try:
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                deleted = await cleanup_expired_rate_limit_records(
+                    session, now=current_time, buffer_seconds=buffer_seconds
+                )
+            return deleted
+    except Exception as error:
+        print(f"Rate limit record cleanup failed: {error}")
+        return 0
+
+
+async def recovery_loop(
+    interval_seconds: float = RECOVERY_INTERVAL_SECONDS,
+    cleanup_interval_seconds: float = RATE_LIMIT_CLEANUP_INTERVAL_SECONDS,
+):
+    loop = asyncio.get_running_loop()
+    last_cleanup_time = float("-inf")
     while True:
         try:
             recovered_ids, reconciliation = await run_recovery_cycle()
@@ -89,6 +118,18 @@ async def recovery_loop(interval_seconds: float = RECOVERY_INTERVAL_SECONDS):
                 print(f"Queue reconciliation failed: {reconciliation.redis_error}")
         except Exception as error:
             print(f"Execution recovery cycle failed: {error}")
+
+        current_monotonic = loop.time()
+        if current_monotonic - last_cleanup_time >= cleanup_interval_seconds:
+            try:
+                deleted_count = await run_rate_limit_cleanup_cycle()
+                if deleted_count > 0:
+                    print(f"Cleaned up {deleted_count} expired rate limit records")
+                last_cleanup_time = current_monotonic
+            except Exception as error:
+                print(f"Rate limit record cleanup failed: {error}")
+                last_cleanup_time = current_monotonic
+
         await asyncio.sleep(interval_seconds)
 
 @app.get("/health")
