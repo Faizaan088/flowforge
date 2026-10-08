@@ -530,6 +530,8 @@ async def check_and_record_admission(
             )
             active_count = (await session.execute(wf_stmt)).scalar() or 0
             if active_count >= policy.max_concurrency:
+                from metrics import CONCURRENCY_ADMISSION_DENIED_TOTAL
+                CONCURRENCY_ADMISSION_DENIED_TOTAL.labels(target_type="workflow").inc()
                 return False, (
                     f"Workflow concurrency limit reached for target '{policy.target_id}': "
                     f"{active_count} active >= limit {policy.max_concurrency}"
@@ -552,6 +554,8 @@ async def check_and_record_admission(
             )
             active_count = (await session.execute(tt_stmt)).scalar() or 0
             if active_count >= policy.max_concurrency:
+                from metrics import CONCURRENCY_ADMISSION_DENIED_TOTAL
+                CONCURRENCY_ADMISSION_DENIED_TOTAL.labels(target_type="task_type").inc()
                 return False, (
                     f"Task type concurrency limit reached for target '{policy.target_id}': "
                     f"{active_count} active >= limit {policy.max_concurrency}"
@@ -568,6 +572,9 @@ async def check_and_record_admission(
         )
         usage_count = (await session.execute(rl_stmt)).scalar() or 0
         if usage_count >= policy.max_requests:
+            from metrics import RATE_LIMIT_ADMISSION_DENIED_TOTAL
+            t_type = policy.target_type.lower() if policy.target_type else "category"
+            RATE_LIMIT_ADMISSION_DENIED_TOTAL.labels(target_type=t_type).inc()
             return False, (
                 f"Rate limit reached for policy '{policy.target_type}:{policy.target_id}': "
                 f"{usage_count} requests in {policy.window_seconds}s >= limit {policy.max_requests}"

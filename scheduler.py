@@ -445,6 +445,8 @@ async def evaluate_due_schedules(
 
     if created_occurrence_ids:
         await session.commit()
+        from metrics import SCHEDULER_OCCURRENCES_CREATED_TOTAL
+        SCHEDULER_OCCURRENCES_CREATED_TOTAL.inc(len(created_occurrence_ids))
 
     return created_occurrence_ids
 
@@ -585,5 +587,7 @@ async def scheduler_loop(
         except asyncio.CancelledError:
             break
         except Exception as error:
+            from metrics import SCHEDULER_OCCURRENCES_FAILED_TOTAL
+            SCHEDULER_OCCURRENCES_FAILED_TOTAL.inc()
             print(f"Scheduler cycle error: {error}")
         await asyncio.sleep(interval_seconds)

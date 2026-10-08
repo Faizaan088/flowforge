@@ -183,6 +183,10 @@ def transition_workflow_run(
             run.started_at = ts
     elif new_status in TERMINAL_RUN_STATUSES:
         run.finished_at = ts
+        from metrics import record_workflow_run_completion
+        record_workflow_run_completion(
+            new_status, started_at=run.started_at, finished_at=run.finished_at
+        )
 
     if error_summary is not None:
         run.error_summary = error_summary

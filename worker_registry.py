@@ -72,5 +72,10 @@ async def heartbeat_worker(session: AsyncSession, worker_id: str) -> datetime:
         heartbeat_at = result.scalar_one_or_none()
 
     if heartbeat_at is None:
+        from metrics import WORKER_HEARTBEAT_FAILURES_TOTAL
+        WORKER_HEARTBEAT_FAILURES_TOTAL.labels(reason="not_found").inc()
         raise UnknownWorkerError(f"Worker {worker_id!r} is not registered")
+
+    from metrics import WORKER_HEARTBEATS_TOTAL
+    WORKER_HEARTBEATS_TOTAL.labels(status="active").inc()
     return heartbeat_at

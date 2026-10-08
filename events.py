@@ -161,9 +161,13 @@ def publish_event(redis_client, event: ExecutionEvent) -> bool:
         return False
     try:
         redis_client.publish(EVENTS_CHANNEL, event.to_json())
+        from metrics import EVENTS_PUBLISHED_TOTAL
+        EVENTS_PUBLISHED_TOTAL.labels(event_type=event.event_type).inc()
         manager.broadcast_local(event)
         return True
     except Exception as err:
+        from metrics import EVENT_PUBLISH_FAILURES_TOTAL
+        EVENT_PUBLISH_FAILURES_TOTAL.labels(event_type=event.event_type).inc()
         logger.warning(
             "Event publication failed for %s (%s): %s",
             event.event_id,
@@ -313,6 +317,8 @@ class WebSocketManager:
         conn = WebSocketConnection(websocket, user)
         async with self._lock:
             self.active_connections.add(conn)
+        from metrics import WEBSOCKET_CONNECTIONS
+        WEBSOCKET_CONNECTIONS.inc()
         return conn
 
     async def disconnect(self, conn: WebSocketConnection) -> None:
@@ -320,6 +326,8 @@ class WebSocketManager:
         conn.is_active = False
         async with self._lock:
             self.active_connections.discard(conn)
+        from metrics import WEBSOCKET_CONNECTIONS
+        WEBSOCKET_CONNECTIONS.dec()
 
     def broadcast_local(self, event: ExecutionEvent) -> None:
         """Distribute an event to connected local clients matching RBAC and filters."""
@@ -333,7 +341,11 @@ class WebSocketManager:
             if conn.subscription.matches(event):
                 try:
                     conn.queue.put_nowait(event)
+                    from metrics import WEBSOCKET_EVENTS_SENT_TOTAL
+                    WEBSOCKET_EVENTS_SENT_TOTAL.inc()
                 except asyncio.QueueFull:
+                    from metrics import WEBSOCKET_EVENTS_DROPPED_TOTAL
+                    WEBSOCKET_EVENTS_DROPPED_TOTAL.inc()
                     # Slow client backpressure: drop event or close if persistently blocked
                     logger.warning("Queue full for client %s, dropping event %s", conn.user.username, event.event_id)
 

@@ -1,6 +1,12 @@
-import json
-import logging
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    Depends,
+    HTTPException,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from contextlib import asynccontextmanager, suppress
 from pydantic import BaseModel, ConfigDict
 from typing import Optional, Dict, Any
@@ -8,6 +14,7 @@ from datetime import datetime, timezone
 import os
 import redis
 import asyncio
+import json
 from redis.exceptions import RedisError
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -66,6 +73,13 @@ from events import (
     create_event,
     manager,
     publish_event,
+)
+from metrics import (
+    CONTENT_TYPE_LATEST,
+    RequestCorrelationMiddleware,
+    generate_latest,
+    record_execution_transition,
+    refresh_queue_gauges,
 )
 
 
@@ -175,6 +189,7 @@ async def lifespan(app: FastAPI):
         print("SHUTTING DOWN...")
 
 app = FastAPI(title="FlowForge API", version="0.1.0", lifespan=lifespan)
+app.add_middleware(RequestCorrelationMiddleware)
 
 
 async def reconcile_queue(db: AsyncSession, execution_ids: Optional[list[int]] = None):
@@ -243,6 +258,12 @@ async def recovery_loop(
         except Exception as error:
             print(f"Execution recovery cycle failed: {error}")
 
+        try:
+            async with AsyncSessionLocal() as session:
+                await refresh_queue_gauges(session)
+        except Exception as error:
+            print(f"Queue gauge refresh failed: {error}")
+
         current_monotonic = loop.time()
         if current_monotonic - last_cleanup_time >= cleanup_interval_seconds:
             try:
@@ -256,9 +277,73 @@ async def recovery_loop(
 
         await asyncio.sleep(interval_seconds)
 
+
+@app.get("/metrics")
+async def prometheus_metrics():
+    """Prometheus exposition format metrics endpoint."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.get("/health")
 async def health_check():
+    """Standard healthcheck preserving existing Docker compatibility."""
     return {"status": "healthy"}
+
+
+@app.get("/health/live")
+async def liveness_check():
+    """Liveness probe for orchestrators."""
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+async def readiness_check(
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """Readiness probe verifying database and Redis connectivity."""
+    db_ok = False
+    try:
+        await db.execute(select(1))
+        db_ok = True
+    except Exception:
+        db_ok = False
+
+    r_url = os.getenv("REDIS_URL")
+    redis_ok = True
+    if r_url:
+        try:
+            redis_client = redis.from_url(r_url, decode_responses=True, socket_timeout=1.0)
+            redis_ok = bool(redis_client.ping())
+        except Exception:
+            redis_ok = False
+
+    is_ready = db_ok and redis_ok
+    if not is_ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    return {
+        "status": "ready" if is_ready else "not_ready",
+        "database": "ok" if db_ok else "unhealthy",
+        "redis": "ok" if redis_ok else "unhealthy",
+    }
+
+
+@app.get("/system/summary")
+async def system_summary(
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:read")),
+):
+    """Operational summary endpoint exposing queue and worker state."""
+    gauges = await refresh_queue_gauges(db, force=True)
+    return {
+        "status": "operational",
+        "active_workers": gauges.get("active_workers", 0),
+        "queued_executions": gauges.get("queued", 0),
+        "running_executions": gauges.get("running", 0),
+        "retry_waiting": gauges.get("retry_waiting", 0),
+        "dead_letters": gauges.get("dead_lettered", 0),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +466,8 @@ async def trigger_job(
         except RedisError as error:
             print(f"Redis enqueue failed for execution {new_execution.id}: {error}")
     
+    record_execution_transition("queued", category=new_execution.category)
+
     publish_event(
         redis_client,
         create_event(

@@ -1,0 +1,441 @@
+"""Production-quality Prometheus metrics and observability for FlowForge.
+
+Provides:
+- Standardized low-cardinality Prometheus metrics for executions, claims, workers,
+  queue depth, scheduler, workflows, concurrency/rate limit policies, and WebSocket events.
+- Histograms for latency distributions (execution duration, queue wait, workflow run duration).
+- Safe metric mutation helpers that guarantee failure in observability never impacts
+  durable PostgreSQL execution state or worker task execution.
+- Cached queue gauge updater preventing database load during Prometheus scrapes.
+- Request correlation middleware adding X-Request-ID headers and logging context.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    REGISTRY,
+    generate_latest,
+)
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.datastructures import MutableHeaders
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+logger = logging.getLogger("flowforge.observability")
+
+# Use standard default registry or custom registry
+registry: CollectorRegistry = REGISTRY
+
+# ---------------------------------------------------------------------------
+# Metric Definitions (Strictly Low-Cardinality Labels)
+# ---------------------------------------------------------------------------
+
+# Executions
+EXECUTIONS_TOTAL = Counter(
+    "flowforge_executions_total",
+    "Total executions processed across lifecycle states.",
+    ["status", "category"],
+    registry=registry,
+)
+
+EXECUTION_DURATION_SECONDS = Histogram(
+    "flowforge_execution_duration_seconds",
+    "Execution duration in seconds from start to terminal completion.",
+    ["status"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0),
+    registry=registry,
+)
+
+EXECUTION_QUEUE_WAIT_SECONDS = Histogram(
+    "flowforge_execution_queue_wait_seconds",
+    "Latency in seconds from execution creation/runnable state to worker claim.",
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0),
+    registry=registry,
+)
+
+EXECUTION_RETRIES_TOTAL = Counter(
+    "flowforge_execution_retries_total",
+    "Total execution failures transitioned to retry wait.",
+    registry=registry,
+)
+
+EXECUTION_DEAD_LETTERED_TOTAL = Counter(
+    "flowforge_execution_dead_lettered_total",
+    "Total executions transitioned to dead letter after exhausting retries.",
+    registry=registry,
+)
+
+EXECUTION_CANCELLED_TOTAL = Counter(
+    "flowforge_execution_cancelled_total",
+    "Total executions cancelled by users or operators.",
+    registry=registry,
+)
+
+EXECUTION_RECOVERED_TOTAL = Counter(
+    "flowforge_execution_recovered_total",
+    "Total expired execution leases recovered by the background maintenance loop.",
+    registry=registry,
+)
+
+# Claims & Workers
+EXECUTION_CLAIMS_TOTAL = Counter(
+    "flowforge_execution_claims_total",
+    "Total worker execution claim attempts.",
+    ["outcome"],  # "claimed", "rejected", "empty"
+    registry=registry,
+)
+
+EXECUTION_CLAIM_FAILURES_TOTAL = Counter(
+    "flowforge_execution_claim_failures_total",
+    "Total failed or rejected execution claim attempts.",
+    ["reason"],  # "policy_denied", "conflict_or_not_found", "lease_expired"
+    registry=registry,
+)
+
+ACTIVE_WORKERS = Gauge(
+    "flowforge_active_workers",
+    "Number of active workers with recent heartbeats.",
+    registry=registry,
+)
+
+WORKER_HEARTBEATS_TOTAL = Counter(
+    "flowforge_worker_heartbeats_total",
+    "Total worker heartbeats received.",
+    ["status"],  # "active", "error"
+    registry=registry,
+)
+
+WORKER_HEARTBEAT_FAILURES_TOTAL = Counter(
+    "flowforge_worker_heartbeat_failures_total",
+    "Total worker heartbeat persistence failures.",
+    ["reason"],  # "not_found", "db_error"
+    registry=registry,
+)
+
+# Queue Depth Gauges (Cached/Periodic Updates)
+QUEUED_EXECUTION_COUNT = Gauge(
+    "flowforge_queued_execution_count",
+    "Current number of executions in QUEUED state in PostgreSQL.",
+    registry=registry,
+)
+
+RETRY_WAITING_EXECUTION_COUNT = Gauge(
+    "flowforge_retry_waiting_execution_count",
+    "Current number of executions in RETRY_WAIT state.",
+    registry=registry,
+)
+
+DEAD_LETTERED_EXECUTION_COUNT = Gauge(
+    "flowforge_dead_lettered_execution_count",
+    "Current number of executions in DEAD_LETTERED state.",
+    registry=registry,
+)
+
+RUNNING_EXECUTION_COUNT = Gauge(
+    "flowforge_running_execution_count",
+    "Current number of executions in CLAIMED or RUNNING state.",
+    registry=registry,
+)
+
+# Scheduler
+SCHEDULER_OCCURRENCES_CREATED_TOTAL = Counter(
+    "flowforge_scheduler_occurrences_created_total",
+    "Total schedule occurrences generated by the scheduler loop.",
+    registry=registry,
+)
+
+SCHEDULER_OCCURRENCES_SKIPPED_TOTAL = Counter(
+    "flowforge_scheduler_occurrences_skipped_total",
+    "Total schedule occurrences skipped due to misfire/coalesce policy.",
+    registry=registry,
+)
+
+SCHEDULER_OCCURRENCES_FAILED_TOTAL = Counter(
+    "flowforge_scheduler_occurrences_failed_total",
+    "Total scheduler cycle evaluation or dispatch failures.",
+    registry=registry,
+)
+
+# Workflows
+WORKFLOW_RUNS_TOTAL = Counter(
+    "flowforge_workflow_runs_total",
+    "Total workflow runs reaching terminal states.",
+    ["status"],  # "succeeded", "failed", "cancelled"
+    registry=registry,
+)
+
+WORKFLOW_RUN_DURATION_SECONDS = Histogram(
+    "flowforge_workflow_run_duration_seconds",
+    "Total elapsed duration of workflow runs in seconds.",
+    buckets=(0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0),
+    registry=registry,
+)
+
+WORKFLOW_FAILURES_TOTAL = Counter(
+    "flowforge_workflow_failures_total",
+    "Total workflow runs that failed due to task failures or errors.",
+    registry=registry,
+)
+
+WORKFLOW_CANCELLATIONS_TOTAL = Counter(
+    "flowforge_workflow_cancellations_total",
+    "Total workflow runs cancelled by operator.",
+    registry=registry,
+)
+
+# Policies
+CONCURRENCY_ADMISSION_DENIED_TOTAL = Counter(
+    "flowforge_concurrency_admission_denied_total",
+    "Total claim attempts blocked by active concurrency limits.",
+    ["target_type"],  # "workflow", "task_type", "category"
+    registry=registry,
+)
+
+RATE_LIMIT_ADMISSION_DENIED_TOTAL = Counter(
+    "flowforge_rate_limit_admission_denied_total",
+    "Total claim attempts blocked by active rate limits.",
+    ["target_type"],  # "workflow", "task_type", "category"
+    registry=registry,
+)
+
+# Events & WebSocket
+EVENTS_PUBLISHED_TOTAL = Counter(
+    "flowforge_events_published_total",
+    "Total live execution events published to Redis Pub/Sub.",
+    ["event_type"],
+    registry=registry,
+)
+
+EVENT_PUBLISH_FAILURES_TOTAL = Counter(
+    "flowforge_event_publish_failures_total",
+    "Total live execution event delivery failures to Redis.",
+    ["event_type"],
+    registry=registry,
+)
+
+WEBSOCKET_CONNECTIONS = Gauge(
+    "flowforge_websocket_connections",
+    "Current active authenticated WebSocket connections.",
+    registry=registry,
+)
+
+WEBSOCKET_EVENTS_SENT_TOTAL = Counter(
+    "flowforge_websocket_events_sent_total",
+    "Total events successfully streamed to WebSocket client sessions.",
+    registry=registry,
+)
+
+WEBSOCKET_EVENTS_DROPPED_TOTAL = Counter(
+    "flowforge_websocket_events_dropped_total",
+    "Total events dropped due to client queue backpressure.",
+    registry=registry,
+)
+
+
+# ---------------------------------------------------------------------------
+# Safe Failure-Isolated Metric Recording Helpers
+# ---------------------------------------------------------------------------
+def _clean_str(val: Optional[str], default: str = "default", max_len: int = 32) -> str:
+    """Normalize label strings to low-cardinality bounded tokens."""
+    if not val:
+        return default
+    s = str(val).strip().lower()
+    return s[:max_len] if s else default
+
+
+def record_execution_transition(
+    status: str,
+    category: Optional[str] = None,
+    created_at: Optional[datetime] = None,
+    started_at: Optional[datetime] = None,
+    finished_at: Optional[datetime] = None,
+) -> None:
+    """Safely record an execution status transition and associated timings."""
+    try:
+        norm_status = _clean_str(status)
+        norm_cat = _clean_str(category)
+        EXECUTIONS_TOTAL.labels(status=norm_status, category=norm_cat).inc()
+
+        # Queue wait time on claim
+        if norm_status in ("claimed", "running") and created_at is not None:
+            now = datetime.now(timezone.utc)
+            wait_sec = max(0.0, (now - created_at).total_seconds())
+            EXECUTION_QUEUE_WAIT_SECONDS.observe(wait_sec)
+
+        # Execution duration on terminal success/failure
+        if norm_status in ("succeeded", "failed") and started_at is not None:
+            end_time = finished_at or datetime.now(timezone.utc)
+            duration_sec = max(0.0, (end_time - started_at).total_seconds())
+            EXECUTION_DURATION_SECONDS.labels(status=norm_status).observe(duration_sec)
+    except Exception as err:
+        logger.debug("Failed to record execution metrics: %s", err)
+
+
+def record_claim_outcome(
+    outcome: str,
+    reason: Optional[str] = None,
+    category: Optional[str] = None,
+    created_at: Optional[datetime] = None,
+) -> None:
+    """Safely record worker claim attempt results."""
+    try:
+        norm_outcome = _clean_str(outcome)
+        EXECUTION_CLAIMS_TOTAL.labels(outcome=norm_outcome).inc()
+        if norm_outcome == "claimed":
+            record_execution_transition("claimed", category=category, created_at=created_at)
+        elif norm_outcome == "rejected" and reason:
+            norm_reason = _clean_str(reason, default="policy_denied")
+            EXECUTION_CLAIM_FAILURES_TOTAL.labels(reason=norm_reason).inc()
+    except Exception as err:
+        logger.debug("Failed to record claim metrics: %s", err)
+
+
+def record_workflow_run_completion(
+    status: str,
+    started_at: Optional[datetime] = None,
+    finished_at: Optional[datetime] = None,
+) -> None:
+    """Safely record workflow run completion and duration."""
+    try:
+        norm_status = _clean_str(status)
+        WORKFLOW_RUNS_TOTAL.labels(status=norm_status).inc()
+        if norm_status == "failed":
+            WORKFLOW_FAILURES_TOTAL.inc()
+        elif norm_status == "cancelled":
+            WORKFLOW_CANCELLATIONS_TOTAL.inc()
+
+        if started_at is not None:
+            end_time = finished_at or datetime.now(timezone.utc)
+            dur = max(0.0, (end_time - started_at).total_seconds())
+            WORKFLOW_RUN_DURATION_SECONDS.observe(dur)
+    except Exception as err:
+        logger.debug("Failed to record workflow metrics: %s", err)
+
+
+# ---------------------------------------------------------------------------
+# Cached Queue Depth and Worker Gauges Refresher
+# ---------------------------------------------------------------------------
+_last_gauges_refresh_time: float = 0.0
+GAUGES_REFRESH_CACHE_TTL_SECONDS: float = 5.0
+
+
+async def refresh_queue_gauges(
+    session: AsyncSession,
+    now: Optional[datetime] = None,
+    force: bool = False,
+) -> dict[str, int]:
+    """Refresh queue depth and active worker gauges from PostgreSQL without full scans.
+
+    Cached with a short TTL to ensure high-frequency /metrics scrapes never hammer the database.
+    """
+    global _last_gauges_refresh_time
+    curr_monotonic = time.monotonic()
+    if not force and (curr_monotonic - _last_gauges_refresh_time < GAUGES_REFRESH_CACHE_TTL_SECONDS):
+        return {}
+
+    eval_time = now or datetime.now(timezone.utc)
+    results = {
+        "queued": 0,
+        "retry_waiting": 0,
+        "dead_lettered": 0,
+        "running": 0,
+        "active_workers": 0,
+    }
+
+    try:
+        from models import Execution, Worker
+
+        # Grouped count query on indexed status column
+        stmt = (
+            select(Execution.status, func.count(Execution.id))
+            .where(
+                Execution.status.in_(
+                    ("QUEUED", "RETRY_WAIT", "DEAD_LETTERED", "CLAIMED", "RUNNING")
+                )
+            )
+            .group_by(Execution.status)
+        )
+        res = await session.execute(stmt)
+        for st, count in res.all():
+            if st == "QUEUED":
+                results["queued"] = count
+                QUEUED_EXECUTION_COUNT.set(count)
+            elif st == "RETRY_WAIT":
+                results["retry_waiting"] = count
+                RETRY_WAITING_EXECUTION_COUNT.set(count)
+            elif st == "DEAD_LETTERED":
+                results["dead_lettered"] = count
+                DEAD_LETTERED_EXECUTION_COUNT.set(count)
+            elif st in ("CLAIMED", "RUNNING"):
+                results["running"] += count
+        RUNNING_EXECUTION_COUNT.set(results["running"])
+
+        # Active worker count with recent heartbeat (< 60 seconds)
+        cutoff = eval_time - timedelta(seconds=60)
+        w_stmt = select(func.count(Worker.worker_id)).where(
+            Worker.status == "ACTIVE",
+            Worker.last_heartbeat_at >= cutoff,
+        )
+        worker_count = (await session.execute(w_stmt)).scalar() or 0
+        results["active_workers"] = worker_count
+        ACTIVE_WORKERS.set(worker_count)
+
+        _last_gauges_refresh_time = curr_monotonic
+    except Exception as err:
+        logger.warning("Failed to refresh queue depth gauges: %s", err)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Request Correlation & Structured Context Middleware
+# ---------------------------------------------------------------------------
+class RequestCorrelationMiddleware:
+    """Pure ASGI middleware ensuring every request carries a correlation ID.
+
+    Extracts incoming X-Request-ID or X-Correlation-ID headers, or generates
+    a unique identifier (req_<hex>), attaching it to the response header.
+    """
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        incoming_id = headers.get(b"x-request-id") or headers.get(b"x-correlation-id")
+        if incoming_id:
+            try:
+                req_id = incoming_id.decode("utf-8")
+            except UnicodeDecodeError:
+                req_id = f"req_{uuid.uuid4().hex[:12]}"
+        else:
+            req_id = f"req_{uuid.uuid4().hex[:12]}"
+
+        if "state" not in scope:
+            scope["state"] = {}
+        scope["state"]["correlation_id"] = req_id
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                resp_headers = MutableHeaders(scope=message)
+                resp_headers.append("x-request-id", req_id)
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)

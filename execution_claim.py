@@ -77,12 +77,17 @@ async def claim_execution(
         claimed_id = row.id
         claimed_worker_id = row.worker_id
         claimed_lease_until = row.lease_until
+        claimed_cat = row.category
+        claimed_created = row.created_at
 
     claim = ExecutionClaim(
         execution_id=claimed_id,
         worker_id=claimed_worker_id,
         lease_until=claimed_lease_until,
     )
+
+    from metrics import record_claim_outcome
+    record_claim_outcome("claimed", category=claimed_cat, created_at=claimed_created)
 
     from events import EVENT_EXECUTION_CLAIMED, create_event, publish_event
     publish_event(
@@ -157,9 +162,13 @@ async def claim_next_execution(
                 worker_id=row.worker_id,
                 lease_until=row.lease_until,
             )
+            claimed_cat = row.category
+            claimed_created = row.created_at
             break
 
+    from metrics import record_claim_outcome
     if claimed_claim is not None:
+        record_claim_outcome("claimed", category=claimed_cat, created_at=claimed_created)
         from events import EVENT_EXECUTION_CLAIMED, create_event, publish_event
         publish_event(
             redis_client,
@@ -171,6 +180,8 @@ async def claim_next_execution(
                 metadata={"lease_until": claimed_claim.lease_until.isoformat()},
             ),
         )
+    else:
+        record_claim_outcome("empty")
     return claimed_claim
 
 
@@ -190,11 +201,14 @@ async def start_execution(
                 Execution.lease_until == claim.lease_until,
             )
             .values(status="RUNNING", started_at=datetime.now(timezone.utc))
-            .returning(Execution.id)
+            .returning(Execution.id, Execution.category)
         )
-        started = result.scalar_one_or_none() is not None
+        row = result.first()
+        started = row is not None
 
     if started:
+        from metrics import record_execution_transition
+        record_execution_transition("running", category=row[1])
         from events import EVENT_EXECUTION_RUNNING, create_event, publish_event
         publish_event(
             redis_client,
@@ -228,12 +242,16 @@ async def complete_execution(
                 lease_until=None,
                 finished_at=datetime.now(timezone.utc),
             )
-            .returning(Execution.id)
+            .returning(Execution.id, Execution.started_at, Execution.finished_at, Execution.category)
         )
-        succeeded = result.scalar_one_or_none() is not None
+        row = result.first()
+        succeeded = row is not None
 
     if not succeeded:
         return False
+
+    from metrics import record_execution_transition
+    record_execution_transition("succeeded", category=row[3], started_at=row[1], finished_at=row[2])
 
     from events import EVENT_EXECUTION_SUCCEEDED, create_event, publish_event
     publish_event(
@@ -275,11 +293,14 @@ async def fail_execution(
                 finished_at=datetime.now(timezone.utc),
                 error_summary=error_summary,
             )
-            .returning(Execution.id)
+            .returning(Execution.id, Execution.started_at, Execution.finished_at, Execution.category)
         )
-        failed = result.scalar_one_or_none() is not None
+        row = result.first()
+        failed = row is not None
 
     if failed:
+        from metrics import record_execution_transition
+        record_execution_transition("failed", category=row[3], started_at=row[1], finished_at=row[2])
         from events import EVENT_EXECUTION_FAILED, create_event, publish_event
         publish_event(
             redis_client,
@@ -352,6 +373,10 @@ async def cancel_execution(
         cancelled_now = True
 
     if cancelled_now:
+        from metrics import EXECUTION_CANCELLED_TOTAL, record_execution_transition
+        EXECUTION_CANCELLED_TOTAL.inc()
+        record_execution_transition("cancelled", category=row.category)
+
         from events import EVENT_EXECUTION_CANCELLED, create_event, publish_event
         publish_event(
             redis_client,

@@ -102,6 +102,10 @@ async def transition_failed_execution(
     )
 
     if outcome == "RETRY_WAIT":
+        from metrics import EXECUTION_RETRIES_TOTAL, record_execution_transition
+        EXECUTION_RETRIES_TOTAL.inc()
+        record_execution_transition("retry_waiting")
+
         publish_event(
             redis_client,
             create_event(
@@ -112,6 +116,10 @@ async def transition_failed_execution(
             ),
         )
     elif outcome == "DEAD_LETTERED":
+        from metrics import EXECUTION_DEAD_LETTERED_TOTAL, record_execution_transition
+        EXECUTION_DEAD_LETTERED_TOTAL.inc()
+        record_execution_transition("dead_lettered")
+
         publish_event(
             redis_client,
             create_event(

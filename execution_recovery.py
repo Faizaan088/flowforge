@@ -37,6 +37,10 @@ async def recover_expired_executions(
         )
         recovered_ids = list(result.scalars())
 
+    if recovered_ids:
+        from metrics import EXECUTION_RECOVERED_TOTAL
+        EXECUTION_RECOVERED_TOTAL.inc(len(recovered_ids))
+
     from events import EVENT_EXECUTION_RECOVERED, create_event, publish_event
     for eid in recovered_ids:
         publish_event(
