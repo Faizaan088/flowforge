@@ -7,10 +7,11 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager, suppress
 from pydantic import BaseModel, ConfigDict
 from typing import Optional, Dict, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import os
 import redis
 import asyncio
@@ -19,6 +20,7 @@ from redis.exceptions import RedisError
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
 
 from database import engine, Base, get_db, AsyncSessionLocal
 import models 
@@ -48,7 +50,13 @@ from queue_reconciliation import (
     enqueue_execution,
     reconcile_queued_executions,
 )
-from workflow_engine import WorkflowValidationError, cancel_workflow_run
+from workflow_engine import (
+    WorkflowValidationError,
+    cancel_workflow_run,
+    create_workflow,
+    create_workflow_run,
+    resolve_and_dispatch,
+)
 from auth import (
     ROLE_ADMIN,
     ROLE_OBSERVER,
@@ -165,6 +173,85 @@ class RateLimitPolicyResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+
+class WorkerResponse(BaseModel):
+    worker_id: str
+    status: str
+    created_at: datetime
+    last_heartbeat_at: datetime
+    is_alive: bool
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WorkflowTaskSummary(BaseModel):
+    id: int
+    name: str
+    task_type: str
+    config: Optional[Dict[str, Any]] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WorkflowEdgeResponse(BaseModel):
+    id: int
+    upstream_task_id: int
+    downstream_task_id: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WorkflowDefinitionResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    created_at: datetime
+    tasks: list[WorkflowTaskSummary] = []
+    edges: list[WorkflowEdgeResponse] = []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WorkflowCreateRequest(BaseModel):
+    name: str
+    description: Optional[str] = None
+    tasks: list[Dict[str, Any]]
+    edges: Optional[list[Any]] = None
+
+
+class WorkflowRunTriggerRequest(BaseModel):
+    triggered_by: Optional[str] = "MANUAL"
+
+
+class WorkflowTaskExecutionResponse(BaseModel):
+    id: int
+    workflow_task_id: int
+    task_name: Optional[str] = None
+    task_type: Optional[str] = None
+    execution_id: Optional[int] = None
+    status: str
+    attempt: int
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    error_summary: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WorkflowRunResponse(BaseModel):
+    id: int
+    workflow_id: int
+    status: str
+    triggered_by: Optional[str] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    error_summary: Optional[str] = None
+    created_at: datetime
+    task_executions: list[WorkflowTaskExecutionResponse] = []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("BOOTING UP API AND CHECKING DATABASE...")
@@ -189,6 +276,14 @@ async def lifespan(app: FastAPI):
         print("SHUTTING DOWN...")
 
 app = FastAPI(title="FlowForge API", version="0.1.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
 app.add_middleware(RequestCorrelationMiddleware)
 
 
@@ -555,6 +650,270 @@ async def update_execution_priority_route(
     await db.commit()
     await db.refresh(updated)
     return updated
+
+
+# ---------------------------------------------------------------------------
+# Workers Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/workers/", response_model=list[WorkerResponse])
+async def list_workers_route(
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:read")),
+):
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(models.Worker).order_by(models.Worker.last_heartbeat_at.desc())
+    )
+    workers = result.scalars().all()
+    alive_threshold = now - timedelta(seconds=60)
+    return [
+        WorkerResponse(
+            worker_id=w.worker_id,
+            status=w.status,
+            created_at=w.created_at,
+            last_heartbeat_at=w.last_heartbeat_at,
+            is_alive=(
+                w.status == "ACTIVE"
+                and w.last_heartbeat_at is not None
+                and w.last_heartbeat_at >= alive_threshold
+            ),
+        )
+        for w in workers
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Workflow Definitions & Runs Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/workflows/", response_model=list[WorkflowDefinitionResponse])
+async def list_workflows_route(
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("workflows:read")),
+):
+    result = await db.execute(
+        select(models.WorkflowDefinition)
+        .options(
+            selectinload(models.WorkflowDefinition.tasks),
+            selectinload(models.WorkflowDefinition.edges),
+        )
+        .order_by(models.WorkflowDefinition.id.desc())
+    )
+    return result.scalars().all()
+
+
+@app.get("/workflows/{workflow_id}", response_model=WorkflowDefinitionResponse)
+async def get_workflow_route(
+    workflow_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("workflows:read")),
+):
+    result = await db.execute(
+        select(models.WorkflowDefinition)
+        .options(
+            selectinload(models.WorkflowDefinition.tasks),
+            selectinload(models.WorkflowDefinition.edges),
+        )
+        .where(models.WorkflowDefinition.id == workflow_id)
+    )
+    wf = result.scalar_one_or_none()
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow definition not found")
+    return wf
+
+
+@app.post("/workflows/", response_model=WorkflowDefinitionResponse, status_code=status.HTTP_201_CREATED)
+async def create_workflow_route(
+    payload: WorkflowCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("workflows:manage")),
+):
+    try:
+        wf = await create_workflow(
+            session=db,
+            name=payload.name,
+            tasks=payload.tasks,
+            edges=payload.edges,
+            description=payload.description,
+            validate=True,
+        )
+        await db.commit()
+    except WorkflowValidationError as err:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(err))
+
+    result = await db.execute(
+        select(models.WorkflowDefinition)
+        .options(
+            selectinload(models.WorkflowDefinition.tasks),
+            selectinload(models.WorkflowDefinition.edges),
+        )
+        .where(models.WorkflowDefinition.id == wf.id)
+    )
+    return result.scalar_one()
+
+
+@app.get("/workflows/runs/", response_model=list[WorkflowRunResponse])
+async def list_workflow_runs_route(
+    workflow_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("workflows:read")),
+):
+    query = (
+        select(models.WorkflowRun)
+        .options(
+            selectinload(models.WorkflowRun.task_executions).selectinload(
+                models.WorkflowTaskExecution.workflow_task
+            )
+        )
+        .order_by(models.WorkflowRun.id.desc())
+    )
+    if workflow_id is not None:
+        query = query.where(models.WorkflowRun.workflow_id == workflow_id)
+
+    result = await db.execute(query)
+    runs = result.scalars().all()
+    out = []
+    for r in runs:
+        task_list = [
+            WorkflowTaskExecutionResponse(
+                id=te.id,
+                workflow_task_id=te.workflow_task_id,
+                task_name=te.workflow_task.name if te.workflow_task else None,
+                task_type=te.workflow_task.task_type if te.workflow_task else None,
+                execution_id=te.execution_id,
+                status=te.status,
+                attempt=te.attempt,
+                started_at=te.started_at,
+                finished_at=te.finished_at,
+                error_summary=te.error_summary,
+            )
+            for te in r.task_executions
+        ]
+        out.append(
+            WorkflowRunResponse(
+                id=r.id,
+                workflow_id=r.workflow_id,
+                status=r.status,
+                triggered_by=r.triggered_by,
+                started_at=r.started_at,
+                finished_at=r.finished_at,
+                error_summary=r.error_summary,
+                created_at=r.created_at,
+                task_executions=task_list,
+            )
+        )
+    return out
+
+
+@app.get("/workflows/runs/{run_id}", response_model=WorkflowRunResponse)
+async def get_workflow_run_route(
+    run_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("workflows:read")),
+):
+    result = await db.execute(
+        select(models.WorkflowRun)
+        .options(
+            selectinload(models.WorkflowRun.task_executions).selectinload(
+                models.WorkflowTaskExecution.workflow_task
+            )
+        )
+        .where(models.WorkflowRun.id == run_id)
+    )
+    run = result.scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Workflow run not found")
+
+    task_list = [
+        WorkflowTaskExecutionResponse(
+            id=te.id,
+            workflow_task_id=te.workflow_task_id,
+            task_name=te.workflow_task.name if te.workflow_task else None,
+            task_type=te.workflow_task.task_type if te.workflow_task else None,
+            execution_id=te.execution_id,
+            status=te.status,
+            attempt=te.attempt,
+            started_at=te.started_at,
+            finished_at=te.finished_at,
+            error_summary=te.error_summary,
+        )
+        for te in run.task_executions
+    ]
+    return WorkflowRunResponse(
+        id=run.id,
+        workflow_id=run.workflow_id,
+        status=run.status,
+        triggered_by=run.triggered_by,
+        started_at=run.started_at,
+        finished_at=run.finished_at,
+        error_summary=run.error_summary,
+        created_at=run.created_at,
+        task_executions=task_list,
+    )
+
+
+@app.post("/workflows/{workflow_id}/runs", response_model=WorkflowRunResponse, status_code=status.HTTP_201_CREATED)
+async def trigger_workflow_run_route(
+    workflow_id: int,
+    payload: Optional[WorkflowRunTriggerRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("workflows:manage")),
+):
+    wf = await db.get(models.WorkflowDefinition, workflow_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow definition not found")
+
+    triggered_by = payload.triggered_by if payload else "MANUAL"
+    try:
+        run = await create_workflow_run(
+            session=db,
+            workflow_id=workflow_id,
+            triggered_by=triggered_by,
+        )
+        r_url = os.getenv("REDIS_URL")
+        redis_client = redis.from_url(r_url, decode_responses=True) if r_url else None
+        await resolve_and_dispatch(db, run.id, redis_client=redis_client)
+        await db.commit()
+    except WorkflowValidationError as err:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(err))
+
+    result = await db.execute(
+        select(models.WorkflowRun)
+        .options(
+            selectinload(models.WorkflowRun.task_executions).selectinload(
+                models.WorkflowTaskExecution.workflow_task
+            )
+        )
+        .where(models.WorkflowRun.id == run.id)
+    )
+    fresh_run = result.scalar_one()
+    task_list = [
+        WorkflowTaskExecutionResponse(
+            id=te.id,
+            workflow_task_id=te.workflow_task_id,
+            task_name=te.workflow_task.name if te.workflow_task else None,
+            task_type=te.workflow_task.task_type if te.workflow_task else None,
+            execution_id=te.execution_id,
+            status=te.status,
+            attempt=te.attempt,
+            started_at=te.started_at,
+            finished_at=te.finished_at,
+            error_summary=te.error_summary,
+        )
+        for te in fresh_run.task_executions
+    ]
+    return WorkflowRunResponse(
+        id=fresh_run.id,
+        workflow_id=fresh_run.workflow_id,
+        status=fresh_run.status,
+        triggered_by=fresh_run.triggered_by,
+        started_at=fresh_run.started_at,
+        finished_at=fresh_run.finished_at,
+        error_summary=fresh_run.error_summary,
+        created_at=fresh_run.created_at,
+        task_executions=task_list,
+    )
 
 
 @app.post("/workflows/runs/{run_id}/cancel")
