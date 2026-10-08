@@ -9,7 +9,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import Execution, ScheduleDefinition, ScheduleOccurrence
+from models import Execution, JobDefinition, ScheduleDefinition, ScheduleOccurrence
 from queue_reconciliation import ReconciliationResult, deliver_executions_to_redis
 
 
@@ -488,15 +488,23 @@ async def dispatch_due_occurrences(
     for occ_id, schedule_def_id in candidates:
         schedule = await session.get(ScheduleDefinition, schedule_def_id)
         job_def_id = None
+        priority = 0
         if schedule:
             cfg = schedule.configuration or schedule.payload or {}
             if isinstance(cfg, dict):
                 job_def_id = cfg.get("job_definition_id")
+                priority = int(cfg.get("priority", 0))
+
+        if job_def_id and priority == 0:
+            job_def = await session.get(JobDefinition, job_def_id)
+            if job_def and job_def.priority:
+                priority = int(job_def.priority)
 
         execution = Execution(
             job_definition_id=job_def_id,
             schedule_occurrence_id=occ_id,
             status="QUEUED",
+            priority=priority,
         )
         session.add(execution)
         await session.flush()

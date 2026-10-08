@@ -23,8 +23,9 @@ class Execution(Base):
     job_definition_id = Column(Integer, ForeignKey("job_definitions.id"))
     schedule_occurrence_id = Column(Integer, ForeignKey("schedule_occurrences.id"), nullable=True, index=True)
     category = Column(String, nullable=True, index=True)
+    priority = Column(Integer, default=0, nullable=False, index=True)
     
-    # QUEUED, CLAIMED, RUNNING, SUCCEEDED, FAILED, RETRY_WAIT, DEAD_LETTERED
+    # QUEUED, CLAIMED, RUNNING, SUCCEEDED, FAILED, RETRY_WAIT, DEAD_LETTERED, CANCELLED
     status = Column(String, default="QUEUED", index=True) 
     attempt = Column(Integer, default=0)
     max_retries = Column(Integer, default=3, nullable=False)
@@ -33,6 +34,7 @@ class Execution(Base):
     lease_until = Column(DateTime(timezone=True), nullable=True)
     available_at = Column(DateTime(timezone=True), nullable=True)
     
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     started_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)
     error_summary = Column(String, nullable=True)

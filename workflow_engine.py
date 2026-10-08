@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import (
     Execution,
+    JobDefinition,
     WorkflowDefinition,
     WorkflowTask,
     WorkflowEdge,
@@ -573,6 +574,16 @@ async def sync_task_execution_status(
         if task_exec.status == TASK_STATUS_RUNNING:
             transition_task_execution(task_exec, TASK_STATUS_READY)
             changed = True
+    elif exec_row.status == "CANCELLED":
+        if task_exec.status == TASK_STATUS_READY:
+            transition_task_execution(task_exec, TASK_STATUS_RUNNING)
+        if task_exec.status in (TASK_STATUS_RUNNING, TASK_STATUS_PENDING):
+            transition_task_execution(
+                task_exec,
+                TASK_STATUS_CANCELLED,
+                error_summary=exec_row.error_summary or "Execution cancelled",
+            )
+            changed = True
 
     return changed
 
@@ -791,14 +802,22 @@ async def dispatch_ready_tasks(
 
         job_def_id = None
         max_retries = 3
+        priority = 0
         if wf_task and wf_task.config and isinstance(wf_task.config, dict):
             job_def_id = wf_task.config.get("job_definition_id") or wf_task.config.get("job_id")
             max_retries = wf_task.config.get("max_retries", 3)
+            priority = int(wf_task.config.get("priority", 0))
+
+        if job_def_id and priority == 0:
+            job_def = await session.get(JobDefinition, job_def_id)
+            if job_def and job_def.priority:
+                priority = int(job_def.priority)
 
         execution = Execution(
             job_definition_id=job_def_id,
             status="QUEUED",
             max_retries=max_retries,
+            priority=priority,
         )
         session.add(execution)
         await session.flush()
@@ -904,8 +923,92 @@ async def advance_workflow_on_execution_terminal(
             session, task_exec.workflow_run_id, redis_client=redis_client
         )
 
+    elif execution.status == "CANCELLED":
+        if task_exec.status not in TERMINAL_TASK_STATUSES:
+            if task_exec.status == TASK_STATUS_READY:
+                transition_task_execution(task_exec, TASK_STATUS_RUNNING)
+            if task_exec.status in (TASK_STATUS_RUNNING, TASK_STATUS_PENDING):
+                transition_task_execution(
+                    task_exec,
+                    TASK_STATUS_CANCELLED,
+                    error_summary=execution.error_summary or "Execution cancelled",
+                )
+        await session.commit()
+        return await resolve_and_dispatch(
+            session, task_exec.workflow_run_id, redis_client=redis_client
+        )
+
     if session.in_transaction():
         await session.commit()
     return None
+
+
+async def cancel_workflow_run(
+    session: AsyncSession,
+    workflow_run_id: int,
+    reason: str | None = None,
+    redis_client=None,
+) -> WorkflowRun:
+    """Atomically cancel a WorkflowRun and any of its active, queued, or pending tasks.
+
+    Semantics:
+    - If already terminal (SUCCEEDED, FAILED, CANCELLED): returns without changing status (idempotent).
+    - If PENDING or RUNNING:
+      - Marks run CANCELLED with finished_at and error_summary.
+      - Any linked non-terminal Execution is cancelled via cancel_execution.
+      - Any non-terminal WorkflowTaskExecution (PENDING, READY, RUNNING) is transitioned to CANCELLED.
+      - Dependent tasks that were PENDING are skipped or cancelled.
+    """
+    from execution_claim import cancel_execution
+
+    run = await session.get(WorkflowRun, workflow_run_id, with_for_update=True)
+    if not run:
+        raise WorkflowValidationError(f"WorkflowRun {workflow_run_id} not found")
+
+    if run.status in TERMINAL_RUN_STATUSES:
+        return run
+
+    now = datetime.now(timezone.utc)
+    cancel_msg = reason or "Workflow run cancelled"
+
+    stmt = (
+        select(WorkflowTaskExecution)
+        .where(WorkflowTaskExecution.workflow_run_id == workflow_run_id)
+        .with_for_update()
+    )
+    task_execs = list((await session.execute(stmt)).scalars().all())
+
+    for te in task_execs:
+        if te.status in TERMINAL_TASK_STATUSES:
+            continue
+
+        if te.execution_id is not None:
+            await cancel_execution(
+                session,
+                te.execution_id,
+                reason=cancel_msg,
+                redis_client=redis_client,
+                now=now,
+                advance_workflow=False,
+            )
+            await session.refresh(te)
+
+        if te.status not in TERMINAL_TASK_STATUSES:
+            if te.status == TASK_STATUS_READY:
+                transition_task_execution(te, TASK_STATUS_RUNNING, now=now)
+            if te.status in (TASK_STATUS_RUNNING, TASK_STATUS_PENDING):
+                transition_task_execution(
+                    te, TASK_STATUS_CANCELLED, error_summary=cancel_msg, now=now
+                )
+
+    if run.status == RUN_STATUS_PENDING:
+        transition_workflow_run(run, RUN_STATUS_RUNNING, now=now)
+    if run.status == RUN_STATUS_RUNNING:
+        transition_workflow_run(
+            run, RUN_STATUS_CANCELLED, error_summary=cancel_msg, now=now
+        )
+
+    await session.commit()
+    return run
 
 

@@ -7,7 +7,12 @@ from contextlib import suppress
 from datetime import timedelta
 
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from execution_claim import claim_execution, complete_execution, start_execution
+from execution_claim import (
+    claim_execution,
+    claim_next_execution,
+    complete_execution,
+    start_execution,
+)
 from worker_registry import heartbeat_worker, register_worker
 
 DB_URL = os.getenv("DATABASE_URL")

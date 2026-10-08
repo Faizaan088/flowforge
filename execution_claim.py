@@ -5,13 +5,25 @@ worker owns an execution.  The conditional UPDATE below is deliberately a
 single statement so PostgreSQL can serialize competing claim attempts.
 """
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import Execution
+
+
+@asynccontextmanager
+async def _atomic_session(session: AsyncSession):
+    """Ensure atomic transaction execution whether session is already in a transaction or not."""
+    if session.in_transaction():
+        yield session
+        await session.flush()
+    else:
+        async with session.begin():
+            yield session
 
 
 @dataclass(frozen=True)
@@ -19,6 +31,14 @@ class ExecutionClaim:
     execution_id: int
     worker_id: str
     lease_until: datetime
+
+
+@dataclass(frozen=True)
+class CancellationResult:
+    execution_id: int
+    cancelled: bool
+    status: str
+    message: str | None = None
 
 
 async def claim_execution(
@@ -36,9 +56,11 @@ async def claim_execution(
     current_time = now or datetime.now(timezone.utc)
     lease_until = current_time + lease_duration
 
-    async with session.begin():
+    async with _atomic_session(session):
         row = await session.get(Execution, int(execution_id), with_for_update=True)
         if row is None or row.status != "QUEUED":
+            return None
+        if row.available_at is not None and row.available_at > current_time:
             return None
 
         from concurrency_policy import check_and_record_admission
@@ -60,6 +82,67 @@ async def claim_execution(
         worker_id=claimed_worker_id,
         lease_until=claimed_lease_until,
     )
+
+
+async def claim_next_execution(
+    session: AsyncSession,
+    worker_id: str,
+    lease_duration: timedelta,
+    now: datetime | None = None,
+) -> ExecutionClaim | None:
+    """Atomically claim the highest-priority runnable QUEUED execution.
+
+    Ordering rule:
+    1. Execution.priority DESC (highest priority first)
+    2. Execution.id ASC (deterministic FIFO tie-breaker)
+
+    Enforces:
+    - Status must be QUEUED
+    - available_at is None or <= now
+    - Concurrency and rate limit policies (via check_and_record_admission)
+    - Concurrency-safe via row locking (with_for_update, skip_locked=True)
+    """
+    current_time = now or datetime.now(timezone.utc)
+    lease_until = current_time + lease_duration
+
+    async with _atomic_session(session):
+        stmt = (
+            select(Execution)
+            .where(
+                Execution.status == "QUEUED",
+                or_(
+                    Execution.available_at.is_(None),
+                    Execution.available_at <= current_time,
+                ),
+            )
+            .order_by(
+                Execution.priority.desc(),
+                Execution.id.asc(),
+            )
+            .with_for_update(skip_locked=True)
+        )
+        result = await session.execute(stmt)
+        candidates = result.scalars().all()
+
+        from concurrency_policy import check_and_record_admission
+
+        for row in candidates:
+            admitted, reason = await check_and_record_admission(
+                session, row, now=current_time
+            )
+            if not admitted:
+                continue
+
+            row.status = "CLAIMED"
+            row.worker_id = worker_id
+            row.lease_until = lease_until
+            return ExecutionClaim(
+                execution_id=row.id,
+                worker_id=row.worker_id,
+                lease_until=row.lease_until,
+            )
+
+    return None
 
 
 async def start_execution(
@@ -141,3 +224,90 @@ async def fail_execution(
             .returning(Execution.id)
         )
         return result.scalar_one_or_none() is not None
+
+
+async def cancel_execution(
+    session: AsyncSession,
+    execution_id: int,
+    reason: str | None = None,
+    redis_client=None,
+    now: datetime | None = None,
+    advance_workflow: bool = True,
+) -> CancellationResult:
+    """Atomically cancel an execution.
+
+    Semantics:
+    - If already CANCELLED: returns cancelled=True (idempotent).
+    - If terminal (SUCCEEDED, DEAD_LETTERED): returns cancelled=False (terminality preserved).
+    - If QUEUED, RETRY_WAIT, CLAIMED, RUNNING, FAILED: transitions to CANCELLED.
+      - Sets status="CANCELLED"
+      - Sets finished_at=now
+      - Clears lease_until=None and available_at=None
+      - Sets error_summary=reason
+    - If linked to a WorkflowTaskExecution and advance_workflow is True, synchronizes task execution and triggers DAG resolution.
+    - Concurrency-safe via row locking (with_for_update=True).
+    """
+    current_time = now or datetime.now(timezone.utc)
+    cancelled_now = False
+
+    async with _atomic_session(session):
+        row = await session.get(Execution, int(execution_id), with_for_update=True)
+        if row is None:
+            return CancellationResult(
+                execution_id=int(execution_id),
+                cancelled=False,
+                status="NOT_FOUND",
+                message="Execution not found",
+            )
+
+        if row.status == "CANCELLED":
+            return CancellationResult(
+                execution_id=row.id,
+                cancelled=True,
+                status="CANCELLED",
+                message="Execution already cancelled",
+            )
+
+        if row.status in ("SUCCEEDED", "DEAD_LETTERED"):
+            return CancellationResult(
+                execution_id=row.id,
+                cancelled=False,
+                status=row.status,
+                message=f"Cannot cancel execution in terminal state '{row.status}'",
+            )
+
+        row.status = "CANCELLED"
+        row.lease_until = None
+        row.available_at = None
+        row.finished_at = current_time
+        row.error_summary = reason or "Execution cancelled"
+        cancelled_now = True
+
+    if cancelled_now and advance_workflow:
+        from workflow_engine import advance_workflow_on_execution_terminal
+
+        await advance_workflow_on_execution_terminal(
+            session, int(execution_id), redis_client=redis_client
+        )
+
+    return CancellationResult(
+        execution_id=int(execution_id),
+        cancelled=True,
+        status="CANCELLED",
+        message="Execution cancelled successfully",
+    )
+
+
+async def update_execution_priority(
+    session: AsyncSession,
+    execution_id: int,
+    priority: int,
+) -> Execution | None:
+    """Update priority of a QUEUED execution. Returns updated Execution or None if not QUEUED/not found."""
+    async with _atomic_session(session):
+        row = await session.get(Execution, int(execution_id), with_for_update=True)
+        if row is None or row.status != "QUEUED":
+            return None
+        row.priority = int(priority)
+        return row
+

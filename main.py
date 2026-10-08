@@ -31,6 +31,7 @@ from concurrency_policy import (
     update_concurrency_limit_policy,
     update_rate_limit_policy,
 )
+from execution_claim import cancel_execution, update_execution_priority
 from execution_recovery import recover_expired_executions
 from execution_retry import requeue_eligible_retries
 from queue_reconciliation import (
@@ -38,6 +39,7 @@ from queue_reconciliation import (
     enqueue_execution,
     reconcile_queued_executions,
 )
+from workflow_engine import WorkflowValidationError, cancel_workflow_run
 
 
 RECOVERY_INTERVAL_SECONDS = float(
@@ -54,6 +56,22 @@ class JobCreate(BaseModel):
     name: str
     payload: Optional[Dict[str, Any]] = None
     priority: int = 0
+
+
+class ExecutionTrigger(BaseModel):
+    priority: Optional[int] = None
+
+
+class ExecutionCancelRequest(BaseModel):
+    reason: Optional[str] = None
+
+
+class ExecutionPriorityUpdate(BaseModel):
+    priority: int
+
+
+class WorkflowCancelRequest(BaseModel):
+    reason: Optional[str] = None
 
 
 class ConcurrencyPolicyCreate(BaseModel):
@@ -217,34 +235,128 @@ async def create_job(job: JobCreate, db: AsyncSession = Depends(get_db)):
     return new_job
 
 @app.post("/jobs/{job_id}/execute")
-async def trigger_job(job_id: int, db: AsyncSession = Depends(get_db)):
+async def trigger_job(
+    job_id: int,
+    payload: Optional[ExecutionTrigger] = None,
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(select(models.JobDefinition).where(models.JobDefinition.id == job_id))
     job = result.scalar_one_or_none()
     
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-        
-    new_execution = models.Execution(job_definition_id=job.id, status="QUEUED")
+
+    prio = payload.priority if payload and payload.priority is not None else (job.priority or 0)
+    new_execution = models.Execution(
+        job_definition_id=job.id,
+        status="QUEUED",
+        priority=prio,
+        category=job.category,
+    )
     db.add(new_execution)
     await db.commit()
     await db.refresh(new_execution)
     
-    print(f"Queued execution {new_execution.id} in Postgres...")
+    print(f"Queued execution {new_execution.id} in Postgres with priority {new_execution.priority}...")
 
     r_url = os.getenv("REDIS_URL")
-    redis_client = redis.from_url(r_url, decode_responses=True)
-    # Redis delivery follows the durable commit; reconciliation replays failures.
-    try:
-        enqueue_execution(redis_client, new_execution.id)
-    except RedisError as error:
-        print(f"Redis enqueue failed for execution {new_execution.id}: {error}")
+    redis_client = redis.from_url(r_url, decode_responses=True) if r_url else None
+    if redis_client:
+        try:
+            enqueue_execution(redis_client, new_execution.id)
+        except RedisError as error:
+            print(f"Redis enqueue failed for execution {new_execution.id}: {error}")
     
     return new_execution
 
+
 @app.get("/executions/")
 async def list_executions(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(models.Execution))
+    result = await db.execute(select(models.Execution).order_by(models.Execution.priority.desc(), models.Execution.id.asc()))
     return result.scalars().all()
+
+
+@app.get("/executions/{execution_id}")
+async def get_execution(execution_id: int, db: AsyncSession = Depends(get_db)):
+    execution = await db.get(models.Execution, execution_id)
+    if not execution:
+        raise HTTPException(status_code=404, detail="Execution not found")
+    return execution
+
+
+@app.post("/executions/{execution_id}/cancel")
+async def cancel_execution_route(
+    execution_id: int,
+    payload: Optional[ExecutionCancelRequest] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    r_url = os.getenv("REDIS_URL")
+    redis_client = redis.from_url(r_url, decode_responses=True) if r_url else None
+    reason = payload.reason if payload else None
+    result = await cancel_execution(
+        session=db,
+        execution_id=execution_id,
+        reason=reason,
+        redis_client=redis_client,
+    )
+    if result.status == "NOT_FOUND":
+        raise HTTPException(status_code=404, detail="Execution not found")
+    if not result.cancelled:
+        raise HTTPException(
+            status_code=409,
+            detail=result.message or f"Execution is already in terminal state '{result.status}'",
+        )
+    return {
+        "message": result.message or "Execution cancelled",
+        "execution_id": execution_id,
+        "status": "CANCELLED",
+    }
+
+
+@app.patch("/executions/{execution_id}/priority")
+@app.post("/executions/{execution_id}/priority", include_in_schema=False)
+async def update_execution_priority_route(
+    execution_id: int,
+    payload: ExecutionPriorityUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    row = await db.get(models.Execution, execution_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Execution not found")
+    if row.status != "QUEUED":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot change priority of execution in status '{row.status}'",
+        )
+    updated = await update_execution_priority(db, execution_id, payload.priority)
+    await db.commit()
+    await db.refresh(updated)
+    return updated
+
+
+@app.post("/workflows/runs/{run_id}/cancel")
+async def cancel_workflow_run_route(
+    run_id: int,
+    payload: Optional[WorkflowCancelRequest] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    r_url = os.getenv("REDIS_URL")
+    redis_client = redis.from_url(r_url, decode_responses=True) if r_url else None
+    reason = payload.reason if payload else None
+    try:
+        run = await cancel_workflow_run(
+            session=db,
+            workflow_run_id=run_id,
+            reason=reason,
+            redis_client=redis_client,
+        )
+        return {
+            "message": "Workflow run cancelled",
+            "run_id": run.id,
+            "status": run.status,
+        }
+    except WorkflowValidationError as err:
+        raise HTTPException(status_code=404, detail=str(err))
 
 
 @app.post("/system/reconcile-queue")
