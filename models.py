@@ -10,6 +10,7 @@ class JobDefinition(Base):
     name = Column(String, index=True, nullable=False)
     
     payload = Column(JSON, nullable=True) 
+    category = Column(String, nullable=True, index=True)
     priority = Column(Integer, default=0)
     max_retries = Column(Integer, default=3, nullable=False)
     
@@ -21,6 +22,7 @@ class Execution(Base):
     id = Column(Integer, primary_key=True, index=True)
     job_definition_id = Column(Integer, ForeignKey("job_definitions.id"))
     schedule_occurrence_id = Column(Integer, ForeignKey("schedule_occurrences.id"), nullable=True, index=True)
+    category = Column(String, nullable=True, index=True)
     
     # QUEUED, CLAIMED, RUNNING, SUCCEEDED, FAILED, RETRY_WAIT, DEAD_LETTERED
     status = Column(String, default="QUEUED", index=True) 
@@ -495,3 +497,117 @@ class WorkflowTaskExecution(Base):
 
 WorkflowTaskRun = WorkflowTaskExecution
 WorkflowNodeExecution = WorkflowTaskExecution
+
+
+class ConcurrencyLimitPolicy(Base):
+    __tablename__ = "concurrency_limit_policies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    target_type = Column(String, nullable=False, index=True)  # "WORKFLOW", "TASK_TYPE"
+    target_id = Column(String, nullable=False, index=True)
+    max_concurrency = Column(Integer, nullable=False, default=1)
+    is_enabled = Column(
+        Boolean, default=True, server_default=expression.true(), nullable=False
+    )
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "target_type IN ('WORKFLOW', 'TASK_TYPE')",
+            name="ck_concurrency_policies_target_type",
+        ),
+        CheckConstraint(
+            "max_concurrency >= 1",
+            name="ck_concurrency_policies_max_concurrency",
+        ),
+        UniqueConstraint(
+            "target_type",
+            "target_id",
+            name="uq_concurrency_policies_target",
+        ),
+    )
+
+
+class RateLimitPolicy(Base):
+    __tablename__ = "rate_limit_policies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    target_type = Column(
+        String, default="CATEGORY", nullable=False, index=True
+    )  # "CATEGORY", "JOB_CATEGORY", "TASK_TYPE", "WORKFLOW"
+    target_id = Column(String, nullable=False, index=True)
+    max_requests = Column(Integer, nullable=False, default=10)
+    window_seconds = Column(Integer, nullable=False, default=60)
+    is_enabled = Column(
+        Boolean, default=True, server_default=expression.true(), nullable=False
+    )
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    records = relationship(
+        "RateLimitRecord",
+        back_populates="policy",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "target_type IN ('CATEGORY', 'JOB_CATEGORY', 'TASK_TYPE', 'WORKFLOW')",
+            name="ck_rate_limit_policies_target_type",
+        ),
+        CheckConstraint(
+            "max_requests >= 1",
+            name="ck_rate_limit_policies_max_requests",
+        ),
+        CheckConstraint(
+            "window_seconds >= 1",
+            name="ck_rate_limit_policies_window_seconds",
+        ),
+        UniqueConstraint(
+            "target_type",
+            "target_id",
+            name="uq_rate_limit_policies_target",
+        ),
+    )
+
+
+class RateLimitRecord(Base):
+    __tablename__ = "rate_limit_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    policy_id = Column(
+        Integer,
+        ForeignKey("rate_limit_policies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    execution_id = Column(
+        Integer,
+        ForeignKey("executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    recorded_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    policy = relationship(
+        "RateLimitPolicy", back_populates="records", lazy="selectin"
+    )
+

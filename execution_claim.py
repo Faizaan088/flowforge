@@ -26,39 +26,39 @@ async def claim_execution(
     execution_id: int,
     worker_id: str,
     lease_duration: timedelta,
+    now: datetime | None = None,
 ) -> ExecutionClaim | None:
-    """Atomically claim a queued execution, or return ``None`` if unavailable.
+    """Atomically claim a queued execution, enforcing concurrency and rate limits.
 
-    The status predicate is part of the UPDATE rather than a preceding read.
-    With PostgreSQL's row locking and READ COMMITTED semantics, concurrent
-    claimers of the same row wait as necessary and only one can update QUEUED
-    to CLAIMED.
+    PostgreSQL row locking serializes competing claim attempts on the Execution
+    row and any applicable policy rows.
     """
-    lease_until = datetime.now(timezone.utc) + lease_duration
+    current_time = now or datetime.now(timezone.utc)
+    lease_until = current_time + lease_duration
 
     async with session.begin():
-        result = await session.execute(
-            update(Execution)
-            .where(
-                Execution.id == int(execution_id),
-                Execution.status == "QUEUED",
-            )
-            .values(
-                status="CLAIMED",
-                worker_id=worker_id,
-                lease_until=lease_until,
-            )
-            .returning(Execution.id, Execution.worker_id, Execution.lease_until)
-        )
-        claimed = result.one_or_none()
+        row = await session.get(Execution, int(execution_id), with_for_update=True)
+        if row is None or row.status != "QUEUED":
+            return None
 
-    if claimed is None:
-        return None
+        from concurrency_policy import check_and_record_admission
+        admitted, reason = await check_and_record_admission(
+            session, row, now=current_time
+        )
+        if not admitted:
+            return None
+
+        row.status = "CLAIMED"
+        row.worker_id = worker_id
+        row.lease_until = lease_until
+        claimed_id = row.id
+        claimed_worker_id = row.worker_id
+        claimed_lease_until = row.lease_until
 
     return ExecutionClaim(
-        execution_id=claimed.id,
-        worker_id=claimed.worker_id,
-        lease_until=claimed.lease_until,
+        execution_id=claimed_id,
+        worker_id=claimed_worker_id,
+        lease_until=claimed_lease_until,
     )
 
 
