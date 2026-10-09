@@ -134,6 +134,21 @@ export async function createUser(payload: { username: string; password: string; 
   return (await api.post<User>("/auth/users", payload)).data;
 }
 
+
+export async function updateUser(
+  userId: number,
+  payload: {
+    role?: string;
+    is_active?: boolean;
+    password?: string;
+  },
+) {
+  return (
+    await api.patch<User>(`/auth/users/${userId}`, payload)
+  ).data;
+}
+
+
 // ---------------------------------------------------------------------------
 // Executions
 // ---------------------------------------------------------------------------

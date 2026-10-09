@@ -101,6 +101,12 @@ class UserCreate(BaseModel):
     role: str = ROLE_OBSERVER
 
 
+class UserUpdate(BaseModel):
+    role: Optional[str] = None
+    is_active: Optional[bool] = None
+    password: Optional[str] = Field(default=None, min_length=4)
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str

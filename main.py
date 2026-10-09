@@ -65,6 +65,8 @@ from auth import (
     TokenResponse,
     UserAlreadyExistsError,
     UserCreate,
+    update_user,
+    UserUpdate,
     UserResponse,
     authenticate_user,
     bootstrap_admin,
@@ -514,6 +516,84 @@ async def list_users_route(
     current_user: models.User = Depends(require_permission("users:manage")),
 ):
     return await list_users(db)
+
+
+@app.patch("/auth/users/{user_id}", response_model=UserResponse)
+async def update_user_route(
+    user_id: int,
+    payload: UserUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("users:manage")),
+):
+    changes = payload.model_dump(exclude_unset=True)
+
+    if not changes:
+        raise HTTPException(status_code=400, detail="No changes supplied")
+
+    # Prevent an administrator from removing their own admin access
+    # or disabling their own account through this endpoint.
+    if user_id == current_user.id:
+        if changes.get("role", current_user.role) != ROLE_ADMIN:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot remove your own administrator role",
+            )
+        if changes.get("is_active") is False:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot disable your own account",
+            )
+
+    target = await db.get(models.User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Never allow the last active administrator to be demoted or disabled.
+    removing_admin = (
+        target.role == ROLE_ADMIN
+        and target.is_active
+        and (
+            changes.get("role", ROLE_ADMIN) != ROLE_ADMIN
+            or changes.get("is_active", True) is False
+        )
+    )
+
+    if removing_admin:
+        result = await db.execute(
+            select(models.User).where(
+                models.User.role == ROLE_ADMIN,
+                models.User.is_active.is_(True),
+            )
+        )
+        active_admins = result.scalars().all()
+
+        if len(active_admins) <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot remove or disable the last active administrator",
+            )
+
+    try:
+        updated = await update_user(
+            session=db,
+            user_id=user_id,
+            role=changes.get("role"),
+            is_active=changes.get("is_active"),
+            password=changes.get("password"),
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        await db.commit()
+        await db.refresh(updated)
+        return updated
+
+    except ValueError as err:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(err))
+    except Exception:
+        await db.rollback()
+        raise
 
 
 # ---------------------------------------------------------------------------

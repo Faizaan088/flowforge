@@ -25,6 +25,8 @@ import {
   Users,
   X,
   XCircle,
+  Moon,
+  Sun,
 } from "lucide-react";
 import {
   cancelExecution,
@@ -48,7 +50,8 @@ import {
   summary,
   systemSweep,
   triggerWorkflowRun,
-  updateExecutionPriority,
+   updateExecutionPriority,
+  updateUser,
   workers,
   workflowRuns,
   workflows,
@@ -214,7 +217,17 @@ function Modal({
 // ---------------------------------------------------------------------------
 // Login View
 // ---------------------------------------------------------------------------
-function Login({ onLogin }: { onLogin: (u: User) => void }) {
+type Theme = "light" | "dark";
+
+function Login({
+  onLogin,
+  theme,
+  onToggleTheme,
+}: {
+  onLogin: (u: User) => void;
+  theme: Theme;
+  onToggleTheme: () => void;
+}) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -235,7 +248,19 @@ function Login({ onLogin }: { onLogin: (u: User) => void }) {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-slate-950 p-6">
+    <div className="relative flex min-h-screen items-center justify-center bg-slate-950 p-6">
+        <button
+      type="button"
+      onClick={onToggleTheme}
+      className="theme-toggle absolute right-6 top-6"
+      aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+      title="Change appearance"
+    >
+      {theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
+      <span className="text-sm">
+        {theme === "dark" ? "Light" : "Dark"}
+      </span>
+    </button>
       <form
         onSubmit={submit}
         className="w-full max-w-md rounded-3xl border border-slate-800 bg-slate-900/90 p-8 shadow-2xl backdrop-blur-md"
@@ -300,9 +325,6 @@ function Login({ onLogin }: { onLogin: (u: User) => void }) {
           )}
         </button>
 
-        <p className="mt-6 text-center text-xs text-slate-500">
-          Default bootstrap: <code className="text-slate-400 font-mono">admin / admin123</code>
-        </p>
       </form>
     </div>
   );
@@ -321,7 +343,17 @@ const NAV_ITEMS = [
   ["/users", "Users", Users],
 ] as const;
 
-function Layout({ user, onLogout }: { user: User; onLogout: () => void }) {
+function Layout({
+  user,
+  onLogout,
+  theme,
+  onToggleTheme,
+}: {
+  user: User;
+  onLogout: () => void;
+  theme: Theme;
+  onToggleTheme: () => void;
+}) {
   const [mobile, setMobile] = useState(false);
   const location = useLocation();
 
@@ -406,9 +438,21 @@ function Layout({ user, onLogout }: { user: User; onLogout: () => void }) {
               <div className="text-xs text-slate-500">Production Control Plane</div>
             </div>
           </div>
-          <div className="flex items-center gap-4">
-            <ApiHealthIndicator />
-          </div>
+<div className="flex items-center gap-4">
+  <ApiHealthIndicator />
+  <button
+    type="button"
+    onClick={onToggleTheme}
+    className="theme-toggle"
+    aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+    title="Change appearance"
+  >
+    {theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
+    <span className="text-sm">
+      {theme === "dark" ? "Light" : "Dark"}
+    </span>
+  </button>
+</div>
         </header>
 
         <main className="p-6 md:p-8">
@@ -2001,6 +2045,10 @@ function UsersPage({ user }: { user: User }) {
   const [allUsers, setAllUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(false);
   const [addModal, setAddModal] = useState(false);
+  const [editingUser, setEditingUser] = useState<User | null>(null);
+const [editRole, setEditRole] = useState("observer");
+const [editActive, setEditActive] = useState(true);
+const [editPassword, setEditPassword] = useState("");
 
   // Form states
   const [newUsername, setNewUsername] = useState("");
@@ -2048,7 +2096,41 @@ function UsersPage({ user }: { user: User }) {
       setBusy(false);
     }
   }
+  async function handleUpdateUser(e: React.FormEvent) {
+  e.preventDefault();
+  if (!editingUser) return;
 
+  setBusy(true);
+  try {
+    await updateUser(editingUser.id, {
+      role: editRole,
+      is_active: editActive,
+      ...(editPassword ? { password: editPassword } : {}),
+    });
+
+    setEditingUser(null);
+    setEditPassword("");
+    loadAll();
+  } catch (err: unknown) {
+    const detail =
+      typeof err === "object" &&
+      err !== null &&
+      "response" in err
+        ? (
+            err as {
+              response?: { data?: { detail?: string } };
+            }
+          ).response?.data?.detail
+        : undefined;
+
+    alert(
+      "Failed to update user: " +
+        (detail || (err instanceof Error ? err.message : String(err))),
+    );
+  } finally {
+    setBusy(false);
+  }
+}
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
@@ -2106,6 +2188,7 @@ function UsersPage({ user }: { user: User }) {
                   <th>Email</th>
                   <th>Status</th>
                   <th>Created</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -2133,6 +2216,20 @@ function UsersPage({ user }: { user: User }) {
                     <td className="text-xs text-slate-500">
                       {new Date(u.created_at).toLocaleDateString()}
                     </td>
+                    <td className="py-3">
+  <button
+    type="button"
+    onClick={() => {
+      setEditingUser(u);
+      setEditRole(u.role);
+      setEditActive(u.is_active);
+      setEditPassword("");
+    }}
+    className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-cyan-500 hover:text-cyan-300"
+  >
+    Edit
+  </button>
+</td>
                   </tr>
                 ))}
               </tbody>
@@ -2205,6 +2302,74 @@ function UsersPage({ user }: { user: User }) {
           </div>
         </form>
       </Modal>
+      
+{/* Edit User Modal */}
+<Modal
+  title={`Edit User${editingUser ? `: ${editingUser.username}` : ""}`}
+  isOpen={editingUser !== null}
+  onClose={() => {
+    setEditingUser(null);
+    setEditPassword("");
+  }}
+>
+  <form onSubmit={handleUpdateUser} className="space-y-4">
+    <label className="block text-sm font-medium text-slate-300">
+      Role
+      <select
+        value={editRole}
+        onChange={(e) => setEditRole(e.target.value)}
+        className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 text-slate-100 outline-none focus:border-cyan-500"
+      >
+        <option value="operator">Operator</option>
+        <option value="observer">Observer (Read-only)</option>
+        <option value="admin">Admin</option>
+      </select>
+    </label>
+
+    <label className="flex items-center gap-3 text-sm text-slate-300">
+      <input
+        type="checkbox"
+        checked={editActive}
+        onChange={(e) => setEditActive(e.target.checked)}
+        className="h-4 w-4 accent-cyan-500"
+      />
+      Account is active
+    </label>
+
+    <label className="block text-sm font-medium text-slate-300">
+      New Password (Optional)
+      <input
+        type="password"
+        minLength={4}
+        value={editPassword}
+        onChange={(e) => setEditPassword(e.target.value)}
+        placeholder="Leave blank to keep current password"
+        className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 text-slate-100 outline-none focus:border-cyan-500"
+      />
+    </label>
+
+    <div className="flex justify-end gap-2 pt-2">
+      <button
+        type="button"
+        onClick={() => {
+          setEditingUser(null);
+          setEditPassword("");
+        }}
+        className="rounded-xl px-4 py-2 text-sm text-slate-400 hover:bg-slate-800"
+      >
+        Cancel
+      </button>
+      <button
+        type="submit"
+        disabled={busy}
+        className="rounded-xl bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-cyan-400 disabled:opacity-50"
+      >
+        {busy ? "Saving..." : "Save Changes"}
+      </button>
+    </div>
+  </form>
+</Modal>
+
     </div>
   );
 }
@@ -2213,6 +2378,20 @@ function UsersPage({ user }: { user: User }) {
 // Root App
 // ---------------------------------------------------------------------------
 export default function App() {
+  const [theme, setTheme] = useState<Theme>(() => {
+  return localStorage.getItem("flowforge_theme") === "light"
+    ? "light"
+    : "dark";
+});
+
+useEffect(() => {
+  document.documentElement.dataset.theme = theme;
+  localStorage.setItem("flowforge_theme", theme);
+}, [theme]);
+
+const toggleTheme = () => {
+  setTheme((current) => current === "dark" ? "light" : "dark");
+};
   const [user, setUser] = useState<User | null>(() => {
     try {
       return JSON.parse(localStorage.getItem("flowforge_user") || "null");
@@ -2233,18 +2412,26 @@ export default function App() {
   }, []);
 
   if (!user) {
-    return <Login onLogin={setUser} />;
+    return (
+  <Login
+    onLogin={setUser}
+    theme={theme}
+    onToggleTheme={toggleTheme}
+  />
+);
   }
 
   return (
     <BrowserRouter>
-      <Layout
-        user={user}
-        onLogout={() => {
-          localStorage.clear();
-          setUser(null);
-        }}
-      />
+<Layout
+  user={user}
+  theme={theme}
+  onToggleTheme={toggleTheme}
+  onLogout={() => {
+    localStorage.clear();
+    setUser(null);
+  }}
+/>
     </BrowserRouter>
   );
 }
