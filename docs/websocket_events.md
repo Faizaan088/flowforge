@@ -1,6 +1,6 @@
 # FlowForge WebSocket Live Execution Events Stream
 
-FlowForge provides a real-time event streaming system over WebSockets (`/ws/events`) designed to allow control-plane dashboards and automated monitoring clients to observe execution and workflow state transitions with low latency and zero database polling.
+FlowForge provides a real-time event streaming system over WebSockets (`/ws/events`) designed to provide low-latency execution and workflow notifications. It is a transient notification channel, not a durable event log or a replacement for reading current state from the API.
 
 ---
 
@@ -13,7 +13,7 @@ FlowForge provides a real-time event streaming system over WebSockets (`/ws/even
    - Redis Pub/Sub channel `flowforge:events` acts as high-throughput, transient event transport across multi-process or clustered instances.
    - A single background Redis Pub/Sub consumer task runs per application process and fans out events to local active WebSocket sessions (preventing connection explosion on Redis).
 3. **Resilience to Redis Failure**:
-   - Any Redis connection or network failure during event publication is caught and logged. Event failures never abort or roll back durable database transactions.
+   - Any Redis connection or network failure during event publication is caught and logged. Event failures never abort or roll back durable database transactions. Because Redis Pub/Sub and per-client WebSocket queues are transient, a publication failure, disconnect, or dropped queue item can cause a client to miss an event. Clients must reconcile against durable API state on connection/reconnection and periodically while open.
 4. **Bounded Queues & Backpressure Management**:
    - Each WebSocket client maintains a bounded FIFO queue (`asyncio.Queue(maxsize=200)`). If a slow client fails to consume events fast enough, excess events are safely dropped to protect the server process from memory exhaustion.
 
@@ -26,29 +26,19 @@ The WebSocket endpoint is exposed at:
 ws://<host>:<port>/ws/events
 ```
 
-### Authentication Methods
-Connections must be authenticated with a valid JWT token issued by `/auth/login`. FlowForge supports three standard authentication transports:
+### Authentication
+Connections must be authenticated with a valid JWT token issued by `/auth/login`. The browser frontend sends the token in the `Sec-WebSocket-Protocol` handshake rather than the URL, avoiding query-string token leakage into ordinary access logs. Production rejects query-string tokens. Do not put tokens in URLs.
 
-1. **Query Parameter (Recommended for browsers)**:
-   ```text
-   ws://localhost:8000/ws/events?token=<JWT_TOKEN>
-   ```
-2. **Authorization Header**:
-   ```http
-   GET /ws/events HTTP/1.1
-   Host: localhost:8000
-   Upgrade: websocket
-   Connection: Upgrade
-   Authorization: Bearer <JWT_TOKEN>
-   ```
-3. **Sec-WebSocket-Protocol**:
-   ```http
-   GET /ws/events HTTP/1.1
-   Host: localhost:8000
-   Upgrade: websocket
-   Connection: Upgrade
-   Sec-WebSocket-Protocol: token.<JWT_TOKEN>
-   ```
+Example browser handshake:
+```http
+GET /ws/events HTTP/1.1
+Host: localhost:8000
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Protocol: flowforge, token.<JWT_TOKEN>
+```
+
+The frontend uses the WebSocket subprotocol list `flowforge` and `token.<JWT_TOKEN>`. Confirm any non-browser client's handshake behavior against the actual server and reverse proxy before deployment; do not assume arbitrary `Authorization` header support.
 
 ### RBAC Authorization
 - Clients must possess one of the following roles: `observer`, `operator`, or `admin`.

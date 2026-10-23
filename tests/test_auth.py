@@ -268,11 +268,19 @@ async def test_admin_bootstrap_service(session_factory, monkeypatch):
         assert admin.role == ROLE_ADMIN
         assert admin.is_active is True
 
-    # Repeated bootstrap is idempotent
+    # Repeated bootstrap is idempotent and must not undo intentional account changes.
+    async with session_factory() as session:
+        user_in_db = await session.get(User, admin.id)
+        user_in_db.role = ROLE_OBSERVER
+        user_in_db.is_active = False
+        await session.commit()
+
     async with session_factory() as session:
         admin2 = await bootstrap_admin(session)
         assert admin2 is not None
         assert admin2.id == admin.id
+        assert admin2.role == ROLE_OBSERVER
+        assert admin2.is_active is False
 
 
 # ===========================================================================

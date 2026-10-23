@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import Execution
+from models import Execution, Worker
 
 
 @asynccontextmanager
@@ -58,6 +58,10 @@ async def claim_execution(
     lease_until = current_time + lease_duration
 
     async with _atomic_session(session):
+        worker_row = await session.get(Worker, str(worker_id))
+        if worker_row is not None and worker_row.status == "DISABLED":
+            return None
+
         row = await session.get(Execution, int(execution_id), with_for_update=True)
         if row is None or row.status != "QUEUED":
             return None
@@ -127,6 +131,10 @@ async def claim_next_execution(
     claimed_claim = None
 
     async with _atomic_session(session):
+        worker_row = await session.get(Worker, str(worker_id))
+        if worker_row is not None and worker_row.status == "DISABLED":
+            return None
+
         stmt = (
             select(Execution)
             .where(
@@ -192,6 +200,10 @@ async def start_execution(
 ) -> bool:
     """Transition an execution to RUNNING only for its exact claim owner."""
     async with _atomic_session(session):
+        worker_row = await session.get(Worker, str(claim.worker_id))
+        if worker_row is not None and worker_row.status == "DISABLED":
+            return False
+
         result = await session.execute(
             update(Execution)
             .where(
@@ -229,6 +241,18 @@ async def complete_execution(
 ) -> bool:
     """Mark an execution successful only when the original claim still owns it."""
     async with _atomic_session(session):
+        worker_row = await session.get(Worker, str(claim.worker_id))
+        if worker_row is not None and worker_row.status == "DISABLED":
+            await fail_execution(
+                session,
+                claim,
+                error_summary=f"Worker {claim.worker_id} was disabled while executing",
+                redis_client=redis_client,
+            )
+            from execution_retry import transition_failed_execution
+            await transition_failed_execution(session, claim.execution_id, redis_client=redis_client)
+            return False
+
         result = await session.execute(
             update(Execution)
             .where(
@@ -313,6 +337,43 @@ async def fail_execution(
             ),
         )
     return failed
+
+
+async def renew_lease(
+    session: AsyncSession,
+    claim: ExecutionClaim,
+    extension_duration: timedelta,
+    now: datetime | None = None,
+) -> ExecutionClaim | None:
+    """Atomically extend an execution lease if the claim still owns the running execution."""
+    current_time = now or datetime.now(timezone.utc)
+    new_lease_until = current_time + extension_duration
+
+    async with _atomic_session(session):
+        worker_row = await session.get(Worker, str(claim.worker_id))
+        if worker_row is not None and worker_row.status == "DISABLED":
+            return None
+
+        result = await session.execute(
+            update(Execution)
+            .where(
+                Execution.id == claim.execution_id,
+                Execution.status.in_(("CLAIMED", "RUNNING")),
+                Execution.worker_id == claim.worker_id,
+                Execution.lease_until == claim.lease_until,
+            )
+            .values(lease_until=new_lease_until)
+            .returning(Execution.id, Execution.worker_id, Execution.lease_until)
+        )
+        row = result.first()
+        if row is None:
+            return None
+
+    return ExecutionClaim(
+        execution_id=row[0],
+        worker_id=row[1],
+        lease_until=row[2],
+    )
 
 
 async def cancel_execution(

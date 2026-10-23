@@ -1,0 +1,9 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Locally installed/generated frontend files
+node_modules
+dist
+.eslintcache

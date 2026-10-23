@@ -13,6 +13,7 @@ MIGRATION_DB_URL = os.getenv(
 )
 
 EXPECTED_APPLICATION_TABLES = {
+    "audit_events",
     "concurrency_limit_policies",
     "job_definitions",
     "rate_limit_policies",
@@ -27,6 +28,9 @@ EXPECTED_APPLICATION_TABLES = {
     "workflow_edges",
     "rate_limit_records",
     "workflow_task_executions",
+    "password_reset_tokens",
+    "email_verification_tokens",
+    "api_keys",
 }
 
 

@@ -1,5 +1,6 @@
 from fastapi import (
     FastAPI,
+    Request,
     Depends,
     HTTPException,
     Response,
@@ -9,10 +10,12 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager, suppress
-from pydantic import BaseModel, ConfigDict
-from typing import Optional, Dict, Any
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Optional, Dict, Any, Literal
 from datetime import datetime, timezone, timedelta
 import os
+import hashlib
+import logging
 import redis
 import asyncio
 import json
@@ -50,6 +53,10 @@ from queue_reconciliation import (
     enqueue_execution,
     reconcile_queued_executions,
 )
+from scheduler import scheduler_loop
+from audit import record_audit_event, list_audit_events
+from worker_registry import disable_worker, enable_worker, UnknownWorkerError
+from task_registry import default_task_registry
 from workflow_engine import (
     WorkflowValidationError,
     cancel_workflow_run,
@@ -76,6 +83,24 @@ from auth import (
     list_users,
     require_permission,
     require_role,
+    ForgotPasswordRequest,
+    ResetPasswordRequest,
+    VerifyEmailRequest,
+    ResendVerificationRequest,
+    ApiKeyCreate,
+    ApiKeyResponse,
+    ApiKeyCreatedResponse,
+    AccountDeleteRequest,
+    revoke_token,
+    request_password_reset,
+    reset_password_with_token,
+    create_email_verification_token,
+    verify_email_with_token,
+    create_api_key,
+    list_api_keys,
+    revoke_api_key,
+    delete_user_account,
+    verify_password,
 )
 from events import (
     EVENT_EXECUTION_QUEUED,
@@ -91,17 +116,17 @@ from metrics import (
     record_execution_transition,
     refresh_queue_gauges,
 )
-from config import get_cors_origins, validate_production_configuration
+from config import get_cors_origins, validate_production_configuration, safe_int, safe_float
 
 
-RECOVERY_INTERVAL_SECONDS = float(
-    os.getenv("EXECUTION_RECOVERY_INTERVAL_SECONDS", "10")
+RECOVERY_INTERVAL_SECONDS = safe_float(
+    os.getenv("EXECUTION_RECOVERY_INTERVAL_SECONDS", "10"), 10.0
 )
-RATE_LIMIT_CLEANUP_INTERVAL_SECONDS = float(
-    os.getenv("RATE_LIMIT_CLEANUP_INTERVAL_SECONDS", "60")
+RATE_LIMIT_CLEANUP_INTERVAL_SECONDS = safe_float(
+    os.getenv("RATE_LIMIT_CLEANUP_INTERVAL_SECONDS", "60"), 60.0
 )
-RATE_LIMIT_RETENTION_BUFFER_SECONDS = int(
-    os.getenv("RATE_LIMIT_RETENTION_BUFFER_SECONDS", "3600")
+RATE_LIMIT_RETENTION_BUFFER_SECONDS = safe_int(
+    os.getenv("RATE_LIMIT_RETENTION_BUFFER_SECONDS", "3600"), 3600
 )
 
 class JobCreate(BaseModel):
@@ -255,6 +280,43 @@ class WorkflowRunResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ScheduleCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    schedule_type: Literal["recurring", "one_time", "delayed"]
+    enabled: bool = True
+    configuration: Optional[Dict[str, Any]] = None
+
+
+class ScheduleUpdateRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    enabled: Optional[bool] = None
+    configuration: Optional[Dict[str, Any]] = None
+
+
+class ScheduleResponse(BaseModel):
+    id: int
+    name: str
+    schedule_type: str
+    enabled: bool
+    configuration: Optional[Dict[str, Any]] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AuditEventResponse(BaseModel):
+    id: int
+    actor_id: str
+    action: str
+    target_type: str
+    target_id: Optional[str] = None
+    metadata_: Optional[Dict[str, Any]] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("BOOTING UP API AND CHECKING CONFIGURATION...")
@@ -271,13 +333,24 @@ async def lifespan(app: FastAPI):
         if reconciliation is not None:
             print(f"Startup queue reconciliation: {reconciliation.as_dict()}")
     r_url = os.getenv("REDIS_URL")
+    redis_client = redis.from_url(r_url, decode_responses=True) if r_url else None
     if r_url:
         await manager.start_redis_listener(r_url)
     recovery_task = asyncio.create_task(recovery_loop())
+    scheduler_task = asyncio.create_task(
+        scheduler_loop(
+            AsyncSessionLocal,
+            redis_client=redis_client,
+            interval_seconds=safe_float(os.getenv("SCHEDULER_INTERVAL_SECONDS", "5.0"), 5.0),
+        )
+    )
     try:
         yield
     finally:
+        scheduler_task.cancel()
         recovery_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await scheduler_task
         with suppress(asyncio.CancelledError):
             await recovery_task
         await manager.stop_redis_listener()
@@ -454,11 +527,116 @@ async def system_summary(
 # ---------------------------------------------------------------------------
 # Authentication & User Management API
 # ---------------------------------------------------------------------------
+LOGIN_RATE_LIMIT_ATTEMPTS = safe_int(os.getenv("LOGIN_RATE_LIMIT_ATTEMPTS", "10"), 10)
+LOGIN_RATE_LIMIT_WINDOW_SECONDS = safe_int(os.getenv("LOGIN_RATE_LIMIT_WINDOW_SECONDS", "900"), 900)
+
+
+def _login_rate_limit_key(request: Request, username: str) -> str:
+    # The reverse proxy overwrites X-Real-IP. Hash identity data rather than
+    # writing raw usernames into Redis keys.
+    client_ip = request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown")
+    normalized_username = username.strip().casefold()
+    identity = hashlib.sha256(f"{client_ip}\0{normalized_username}".encode("utf-8")).hexdigest()
+    return f"flowforge:login-attempts:{identity}"
+
+
+async def enforce_login_rate_limit(request: Request, username: str) -> str:
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        if os.getenv("ENVIRONMENT", "development").lower() == "production":
+            raise HTTPException(status_code=503, detail="Login temporarily unavailable")
+        return ""
+    try:
+        from redis.asyncio import Redis
+        async with Redis.from_url(redis_url, decode_responses=True) as client:
+            key = _login_rate_limit_key(request, username)
+            client_ip = request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown")
+            ip_hash = hashlib.sha256(client_ip.encode("utf-8")).hexdigest()
+            ip_key = f"flowforge:login-ip-attempts:{ip_hash}"
+            username_attempts = await client.incr(key)
+            ip_attempts = await client.incr(ip_key)
+            if username_attempts == 1:
+                await client.expire(key, LOGIN_RATE_LIMIT_WINDOW_SECONDS)
+            if ip_attempts == 1:
+                await client.expire(ip_key, LOGIN_RATE_LIMIT_WINDOW_SECONDS)
+            if max(username_attempts, ip_attempts) > LOGIN_RATE_LIMIT_ATTEMPTS:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many login attempts. Try again later.",
+                    headers={"Retry-After": str(LOGIN_RATE_LIMIT_WINDOW_SECONDS)},
+                )
+            return f"{key}|{ip_key}"
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.getLogger("flowforge.auth").warning(
+            "Login rate limiter unavailable (%s)", type(exc).__name__
+        )
+        if os.getenv("ENVIRONMENT", "development").lower() == "production":
+            raise HTTPException(status_code=503, detail="Login temporarily unavailable") from exc
+        return ""
+
+
+async def clear_login_rate_limit(key: str) -> None:
+    if not key:
+        return
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        return
+    try:
+        from redis.asyncio import Redis
+        async with Redis.from_url(redis_url, decode_responses=True) as client:
+            await client.delete(*[part for part in key.split("|") if part])
+    except Exception as exc:
+        logging.getLogger("flowforge.auth").debug(
+            "Could not clear login attempt counter (%s)", type(exc).__name__
+        )
+
+
+async def enforce_auth_action_rate_limit(
+    request: Request,
+    action: str,
+    identifier: str,
+    max_attempts: int = 5,
+    window_seconds: int = 300,
+) -> str:
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        return ""
+    try:
+        from redis.asyncio import Redis
+        async with Redis.from_url(redis_url, decode_responses=True) as client:
+            client_ip = request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown")
+            normalized = identifier.strip().casefold()
+            identity = hashlib.sha256(f"{action}\0{client_ip}\0{normalized}".encode("utf-8")).hexdigest()
+            key = f"flowforge:rate-limit:{action}:{identity}"
+            attempts = await client.incr(key)
+            if attempts == 1:
+                await client.expire(key, window_seconds)
+            if attempts > max_attempts:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Too many requests. Please wait before trying again.",
+                    headers={"Retry-After": str(window_seconds)},
+                )
+            return key
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.getLogger("flowforge.auth").warning(
+            "Rate limiter error for %s (%s)", action, type(exc).__name__
+        )
+        return ""
+
+
 @app.post("/auth/login", response_model=TokenResponse)
 async def login(
     payload: LoginRequest,
+    request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
+    rate_limit_key = await enforce_login_rate_limit(request, payload.username)
     user = await authenticate_user(db, payload.username, payload.password)
     if not user:
         raise HTTPException(
@@ -472,6 +650,9 @@ async def login(
             detail="User account is disabled",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    await clear_login_rate_limit(rate_limit_key)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     token = create_access_token(user)
     return TokenResponse(
         access_token=token,
@@ -500,6 +681,14 @@ async def create_user_route(
             password=payload.password,
             role=payload.role,
             email=payload.email,
+        )
+        await record_audit_event(
+            db,
+            actor_id=str(current_user.id),
+            action="USER_CREATED",
+            target_type="USER",
+            target_id=str(user.id),
+            metadata={"username": user.username, "role": user.role},
         )
         await db.commit()
         await db.refresh(user)
@@ -584,6 +773,17 @@ async def update_user_route(
         if updated is None:
             raise HTTPException(status_code=404, detail="User not found")
 
+        audit_changes = sorted(key for key in changes if key != "password")
+        if "password" in changes:
+            audit_changes.append("password_changed")
+        await record_audit_event(
+            db,
+            actor_id=str(current_user.id),
+            action="USER_UPDATED",
+            target_type="USER",
+            target_id=str(updated.id),
+            metadata={"changed_fields": audit_changes},
+        )
         await db.commit()
         await db.refresh(updated)
         return updated
@@ -596,9 +796,228 @@ async def update_user_route(
         raise
 
 
+@app.post("/auth/logout")
+async def logout(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    auth_header = request.headers.get("Authorization")
+    if auth_header:
+        parts = auth_header.strip().split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            revoke_token(parts[1])
+    return {"message": "Logged out successfully"}
+
+
+@app.post("/auth/forgot-password")
+async def forgot_password_route(
+    payload: ForgotPasswordRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    await enforce_auth_action_rate_limit(request, "forgot-password", payload.email_or_username, max_attempts=5, window_seconds=300)
+    base_url = str(request.base_url).rstrip("/")
+    origin = request.headers.get("origin")
+    if origin:
+        base_url = origin
+    await request_password_reset(db, payload.email_or_username, base_url=base_url)
+    await db.commit()
+    return {"message": "If an account matches that email or username, password reset instructions have been sent."}
+
+
+@app.post("/auth/reset-password")
+async def reset_password_route(
+    payload: ResetPasswordRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    await enforce_auth_action_rate_limit(request, "reset-password", payload.token[:16], max_attempts=5, window_seconds=300)
+    try:
+        user = await reset_password_with_token(db, payload.token, payload.new_password)
+        await record_audit_event(
+            db,
+            actor_id=str(user.id),
+            action="PASSWORD_RESET",
+            target_type="USER",
+            target_id=str(user.id),
+        )
+        await db.commit()
+        return {"message": "Password reset successfully. You may now log in with your new password."}
+    except ValueError as err:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.post("/auth/verify-email")
+async def verify_email_route(
+    payload: VerifyEmailRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        user = await verify_email_with_token(db, payload.token)
+        await record_audit_event(
+            db,
+            actor_id=str(user.id),
+            action="EMAIL_VERIFIED",
+            target_type="USER",
+            target_id=str(user.id),
+        )
+        await db.commit()
+        return {"message": "Email verified successfully."}
+    except ValueError as err:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.post("/auth/resend-verification")
+async def resend_verification_route(
+    request: Request,
+    payload: ResendVerificationRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    user = None
+    auth_header = request.headers.get("Authorization")
+    if auth_header:
+        try:
+            user = await get_current_user(request, db)
+        except Exception:
+            pass
+    if user is None and payload.email:
+        from auth import get_user_by_email
+        user = await get_user_by_email(db, payload.email)
+
+    if user and not user.is_verified:
+        await enforce_auth_action_rate_limit(request, "resend-verification", user.username, max_attempts=3, window_seconds=300)
+        base_url = request.headers.get("origin") or str(request.base_url).rstrip("/")
+        await create_email_verification_token(db, user, base_url=base_url)
+        await db.commit()
+
+    return {"message": "If an unverified account matches, verification instructions have been sent."}
+
+
+@app.delete("/users/me")
+async def delete_my_account(
+    payload: AccountDeleteRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    if payload.confirm_username != current_user.username:
+        raise HTTPException(status_code=400, detail="Username confirmation does not match")
+    if not verify_password(payload.password, current_user.password_hash):
+        raise HTTPException(status_code=400, detail="Incorrect password")
+
+    user_id = current_user.id
+    try:
+        await delete_user_account(db, user_id)
+        auth_header = request.headers.get("Authorization")
+        if auth_header:
+            parts = auth_header.strip().split()
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                revoke_token(parts[1])
+        await db.commit()
+        return {"message": "Account successfully deleted"}
+    except ValueError as err:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+# ---------------------------------------------------------------------------
+# API Key Management
+# ---------------------------------------------------------------------------
+@app.get("/api-keys/", response_model=list[ApiKeyResponse])
+async def list_user_api_keys(
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    return await list_api_keys(db, current_user.id)
+
+
+@app.post("/api-keys/", response_model=ApiKeyCreatedResponse, status_code=status.HTTP_201_CREATED)
+async def create_user_api_key(
+    payload: ApiKeyCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    try:
+        key_record, raw_key = await create_api_key(
+            session=db,
+            user_id=current_user.id,
+            name=payload.name,
+            expires_in_days=payload.expires_in_days,
+        )
+        await record_audit_event(
+            db,
+            actor_id=str(current_user.id),
+            action="API_KEY_CREATED",
+            target_type="API_KEY",
+            target_id=str(key_record.id),
+            metadata={"name": key_record.name, "prefix": key_record.key_prefix},
+        )
+        await db.commit()
+        await db.refresh(key_record)
+        return ApiKeyCreatedResponse(
+            api_key=ApiKeyResponse.model_validate(key_record),
+            raw_key=raw_key,
+        )
+    except ValueError as err:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(err))
+
+
+@app.delete("/api-keys/{key_id}")
+async def revoke_user_api_key(
+    key_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    revoked = await revoke_api_key(db, current_user.id, key_id)
+    if not revoked:
+        raise HTTPException(status_code=404, detail="API key not found")
+    await record_audit_event(
+        db,
+        actor_id=str(current_user.id),
+        action="API_KEY_REVOKED",
+        target_type="API_KEY",
+        target_id=str(key_id),
+    )
+    await db.commit()
+    return {"message": "API key revoked successfully", "id": key_id}
+
+
 # ---------------------------------------------------------------------------
 # Jobs & Executions API (Protected by RBAC)
 # ---------------------------------------------------------------------------
+@app.get("/jobs/")
+async def list_jobs_route(
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:read")),
+):
+    stmt = select(models.JobDefinition)
+    if current_user.role not in (ROLE_ADMIN, ROLE_OBSERVER):
+        stmt = stmt.where(
+            (models.JobDefinition.user_id == current_user.id)
+            | (models.JobDefinition.user_id.is_(None))
+        )
+    stmt = stmt.order_by(models.JobDefinition.id.desc())
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+@app.get("/jobs/{job_id}")
+async def get_job_route(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:read")),
+):
+    job = await db.get(models.JobDefinition, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if current_user.role not in (ROLE_ADMIN, ROLE_OBSERVER) and job.user_id is not None and job.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden: You do not own this job")
+    return job
+
+
 @app.post("/jobs/")
 async def create_job(
     job: JobCreate,
@@ -608,11 +1027,22 @@ async def create_job(
     new_job = models.JobDefinition(
         name=job.name, 
         payload=job.payload, 
-        priority=job.priority
+        priority=job.priority,
+        user_id=current_user.id,
     )
     db.add(new_job)
     await db.commit()
     await db.refresh(new_job)
+
+    await record_audit_event(
+        db,
+        actor_id=str(current_user.id),
+        action="JOB_CREATED",
+        target_type="JOB_DEFINITION",
+        target_id=str(new_job.id),
+        metadata={"name": new_job.name, "priority": new_job.priority},
+    )
+    await db.commit()
     return new_job
 
 @app.post("/jobs/{job_id}/execute")
@@ -627,6 +1057,8 @@ async def trigger_job(
     
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if current_user.role != ROLE_ADMIN and job.user_id is not None and job.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden: You do not own this job")
 
     prio = payload.priority if payload and payload.priority is not None else (job.priority or 0)
     new_execution = models.Execution(
@@ -770,7 +1202,67 @@ async def list_workers_route(
     ]
 
 
-# ---------------------------------------------------------------------------
+@app.post("/workers/{worker_id}/disable", response_model=WorkerResponse)
+async def disable_worker_route(
+    worker_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:manage")),
+):
+    try:
+        r_url = os.getenv("REDIS_URL")
+        redis_client = redis.from_url(r_url, decode_responses=True) if r_url else None
+        w = await disable_worker(db, worker_id, redis_client=redis_client)
+        await record_audit_event(
+            db,
+            actor_id=str(current_user.id),
+            action="WORKER_DISABLED",
+            target_type="WORKER",
+            target_id=worker_id,
+        )
+        await db.commit()
+        return WorkerResponse(
+            worker_id=w.worker_id,
+            status=w.status,
+            created_at=w.created_at,
+            last_heartbeat_at=w.last_heartbeat_at,
+            is_alive=False,
+        )
+    except UnknownWorkerError as err:
+        raise HTTPException(status_code=404, detail=str(err))
+
+
+@app.post("/workers/{worker_id}/enable", response_model=WorkerResponse)
+async def enable_worker_route(
+    worker_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("policies:manage")),
+):
+    try:
+        w = await enable_worker(db, worker_id)
+        await record_audit_event(
+            db,
+            actor_id=str(current_user.id),
+            action="WORKER_ENABLED",
+            target_type="WORKER",
+            target_id=worker_id,
+        )
+        await db.commit()
+        now = datetime.now(timezone.utc)
+        alive_threshold = now - timedelta(seconds=60)
+        return WorkerResponse(
+            worker_id=w.worker_id,
+            status=w.status,
+            created_at=w.created_at,
+            last_heartbeat_at=w.last_heartbeat_at,
+            is_alive=(
+                w.status == "ACTIVE"
+                and w.last_heartbeat_at is not None
+                and w.last_heartbeat_at >= alive_threshold
+            ),
+        )
+    except UnknownWorkerError as err:
+        raise HTTPException(status_code=404, detail=str(err))
+
 # Workflow Definitions & Runs Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/workflows/", response_model=list[WorkflowDefinitionResponse])
@@ -778,14 +1270,20 @@ async def list_workflows_route(
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(require_permission("workflows:read")),
 ):
-    result = await db.execute(
+    stmt = (
         select(models.WorkflowDefinition)
         .options(
             selectinload(models.WorkflowDefinition.tasks),
             selectinload(models.WorkflowDefinition.edges),
         )
-        .order_by(models.WorkflowDefinition.id.desc())
     )
+    if current_user.role not in (ROLE_ADMIN, ROLE_OBSERVER):
+        stmt = stmt.where(
+            (models.WorkflowDefinition.user_id == current_user.id)
+            | (models.WorkflowDefinition.user_id.is_(None))
+        )
+    stmt = stmt.order_by(models.WorkflowDefinition.id.desc())
+    result = await db.execute(stmt)
     return result.scalars().all()
 
 
@@ -806,6 +1304,8 @@ async def get_workflow_route(
     wf = result.scalar_one_or_none()
     if not wf:
         raise HTTPException(status_code=404, detail="Workflow definition not found")
+    if current_user.role not in (ROLE_ADMIN, ROLE_OBSERVER) and wf.user_id is not None and wf.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden: You do not own this workflow")
     return wf
 
 
@@ -823,6 +1323,16 @@ async def create_workflow_route(
             edges=payload.edges,
             description=payload.description,
             validate=True,
+            user_id=current_user.id,
+        )
+        await db.commit()
+        await record_audit_event(
+            db,
+            actor_id=str(current_user.id),
+            action="WORKFLOW_CREATED",
+            target_type="WORKFLOW_DEFINITION",
+            target_id=str(wf.id),
+            metadata={"name": wf.name, "task_count": len(payload.tasks), "edge_count": len(payload.edges)},
         )
         await db.commit()
     except WorkflowValidationError as err:
@@ -961,6 +1471,14 @@ async def trigger_workflow_run_route(
         r_url = os.getenv("REDIS_URL")
         redis_client = redis.from_url(r_url, decode_responses=True) if r_url else None
         await resolve_and_dispatch(db, run.id, redis_client=redis_client)
+        await record_audit_event(
+            db,
+            actor_id=str(current_user.id),
+            action="WORKFLOW_RUN_TRIGGERED",
+            target_type="WORKFLOW_RUN",
+            target_id=str(run.id),
+            metadata={"workflow_id": workflow_id, "triggered_by": triggered_by},
+        )
         await db.commit()
     except WorkflowValidationError as err:
         await db.rollback()
@@ -1021,6 +1539,15 @@ async def cancel_workflow_run_route(
             reason=reason,
             redis_client=redis_client,
         )
+        await record_audit_event(
+            db,
+            actor_id=str(current_user.id),
+            action="WORKFLOW_RUN_CANCEL_REQUESTED",
+            target_type="WORKFLOW_RUN",
+            target_id=str(run.id),
+            metadata={"status": run.status},
+        )
+        await db.commit()
         return {
             "message": "Workflow run cancelled",
             "run_id": run.id,
@@ -1401,6 +1928,145 @@ async def delete_rate_limit_policy_route(
         raise HTTPException(status_code=404, detail="Rate limit policy not found")
     await db.commit()
     return {"message": "Rate limit policy deleted", "id": policy_id}
+
+
+# ---------------------------------------------------------------------------
+# Schedules API
+# ---------------------------------------------------------------------------
+@app.get("/schedules/", response_model=list[ScheduleResponse])
+async def list_schedules_route(
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:read")),
+):
+    stmt = select(models.ScheduleDefinition)
+    if current_user.role not in (ROLE_ADMIN, ROLE_OBSERVER):
+        stmt = stmt.where(
+            (models.ScheduleDefinition.user_id == current_user.id)
+            | (models.ScheduleDefinition.user_id.is_(None))
+        )
+    stmt = stmt.order_by(models.ScheduleDefinition.id.desc())
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+@app.get("/schedules/{schedule_id}", response_model=ScheduleResponse)
+async def get_schedule_route(
+    schedule_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:read")),
+):
+    schedule = await db.get(models.ScheduleDefinition, schedule_id)
+    if not schedule:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    if current_user.role not in (ROLE_ADMIN, ROLE_OBSERVER) and schedule.user_id is not None and schedule.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden: You do not own this schedule")
+    return schedule
+
+
+@app.post("/schedules/", response_model=ScheduleResponse, status_code=status.HTTP_201_CREATED)
+async def create_schedule_route(
+    payload: ScheduleCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:trigger")),
+):
+    schedule = models.ScheduleDefinition(
+        name=payload.name,
+        schedule_type=payload.schedule_type,
+        enabled=payload.enabled,
+        configuration=payload.configuration,
+        user_id=current_user.id,
+    )
+    db.add(schedule)
+    await db.commit()
+    await db.refresh(schedule)
+
+    await record_audit_event(
+        db,
+        actor_id=str(current_user.id),
+        action="SCHEDULE_CREATED",
+        target_type="SCHEDULE",
+        target_id=str(schedule.id),
+        metadata={"name": schedule.name, "type": schedule.schedule_type},
+    )
+    await db.commit()
+    return schedule
+
+
+@app.patch("/schedules/{schedule_id}", response_model=ScheduleResponse)
+async def update_schedule_route(
+    schedule_id: int,
+    payload: ScheduleUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:trigger")),
+):
+    schedule = await db.get(models.ScheduleDefinition, schedule_id)
+    if not schedule:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+
+    changes = payload.model_dump(exclude_unset=True)
+    if "name" in changes:
+        schedule.name = changes["name"]
+    if "enabled" in changes:
+        schedule.enabled = changes["enabled"]
+    if "configuration" in changes:
+        schedule.configuration = changes["configuration"]
+
+    await record_audit_event(
+        db,
+        actor_id=str(current_user.id),
+        action="SCHEDULE_UPDATED",
+        target_type="SCHEDULE",
+        target_id=str(schedule.id),
+        metadata=changes,
+    )
+    await db.commit()
+    await db.refresh(schedule)
+    return schedule
+
+
+@app.delete("/schedules/{schedule_id}")
+async def delete_schedule_route(
+    schedule_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("executions:trigger")),
+):
+    schedule = await db.get(models.ScheduleDefinition, schedule_id)
+    if not schedule:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    await db.delete(schedule)
+    await record_audit_event(
+        db,
+        actor_id=str(current_user.id),
+        action="SCHEDULE_DELETED",
+        target_type="SCHEDULE",
+        target_id=str(schedule_id),
+    )
+    await db.commit()
+    return {"message": "Schedule deleted", "id": schedule_id}
+
+
+# ---------------------------------------------------------------------------
+# Audit API
+# ---------------------------------------------------------------------------
+@app.get("/audit/", response_model=list[AuditEventResponse])
+async def list_audit_events_route(
+    actor_id: Optional[str] = None,
+    action: Optional[str] = None,
+    target_type: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(require_permission("users:manage")),
+):
+    events = await list_audit_events(
+        db,
+        actor_id=actor_id,
+        action=action,
+        target_type=target_type,
+        limit=limit,
+        offset=offset,
+    )
+    return events
 
 
 # ---------------------------------------------------------------------------

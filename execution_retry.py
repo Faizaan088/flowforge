@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from execution_claim import ExecutionClaim, fail_execution
 from models import Execution
+from config import safe_float
 
 
 @asynccontextmanager
@@ -30,7 +31,7 @@ async def _atomic_session(session: AsyncSession):
 
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BASE_DELAY = timedelta(
-    seconds=float(os.getenv("EXECUTION_RETRY_BASE_DELAY_SECONDS", "10"))
+    seconds=safe_float(os.getenv("EXECUTION_RETRY_BASE_DELAY_SECONDS", "10"), 10.0)
 )
 DEFAULT_BACKOFF_FACTOR = 2.0
 

@@ -58,12 +58,20 @@ When `ENVIRONMENT=production`, FlowForge validates security configurations befor
   - Generate via: `openssl rand -hex 32`
 - `FLOWFORGE_ADMIN_PASSWORD`:
   - Must be explicitly configured.
-  - Must be at least 8 characters long.
+  - Must be between 12 and 128 characters and differ from the administrator username.
 - `CORS_ALLOWED_ORIGINS` / `CORS_ORIGINS`:
   - Must be explicitly set to trusted origin domains (e.g. `https://dashboard.flowforge.internal`).
   - Wildcard `*` origin is strictly forbidden in production.
 - `DATABASE_URL`:
-  - Must be configured.
+  - Must be a valid PostgreSQL URL with a unique password.
+  - The Compose-interpolated database password must be at least 24 URL-safe characters (`A-Z`, `a-z`, `0-9`, `_`, `-`) because it is embedded directly in the URL.
+- `REDIS_URL` / `REDIS_PASSWORD`:
+  - Redis authentication must be enabled.
+  - The password must be at least 32 URL-safe characters (`A-Z`, `a-z`, `0-9`, `_`, `-`).
+- `CORS_ALLOWED_ORIGINS`:
+  - Production origins must use HTTPS and match the public frontend origin.
+- Login throttling:
+  - Shared Redis-backed rate limiting defaults to 10 attempts per username/IP pair and per IP across usernames per 15 minutes.
 - `AUTO_CREATE_TABLES`:
   - Defaults to `false`. Production uses Alembic migrations exclusively.
 
@@ -79,8 +87,10 @@ cp .env.example .env
 # Edit .env with secure production values
 
 # 2. Build and start services
-docker compose up --build -d
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
 ```
+
+**Do not use the base-only command for public production deployments.** The base file is intended for local development. Configure TLS at a trusted HTTPS reverse proxy/load balancer before exposing the frontend publicly; this Compose overlay only publishes HTTP.
 
 ### Service Architecture & Startup Order
 1. **`postgres`**: PostgreSQL 15 container with `pg_isready` healthcheck.
@@ -88,4 +98,4 @@ docker compose up --build -d
 3. **`migration`**: Ephemeral container running `alembic upgrade head` after `postgres` becomes healthy.
 4. **`api`**: FastAPI control plane booting only after `migration` completes successfully and `redis` is healthy. Verified via `/health` endpoint healthcheck.
 5. **`worker`**: Background queue execution worker running after migrations complete.
-6. **`frontend`**: Production Nginx container serving built React dashboard on port 3000, reverse-proxying API and WebSockets to `api`.
+6. **`frontend`**: Production Nginx container serving the built React dashboard on container port 80, reverse-proxying API and WebSockets to `api`. The host port is controlled by `PROD_HTTP_PORT` (default 80); terminate HTTPS at a trusted reverse proxy/load balancer.

@@ -337,3 +337,103 @@ async def test_error_semantics_with_authenticated_user(raw_client, users_and_tok
         headers=admin_headers,
     )
     assert bad_pol.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_user_management_and_admin_safeguards(raw_client, session_factory, users_and_tokens):
+    """Verify administrator safeguards: self-demotion, self-deactivation, last admin protection, and password resets."""
+    admin_headers = {"Authorization": f"Bearer {users_and_tokens['admin_token']}"}
+    operator_headers = {"Authorization": f"Bearer {users_and_tokens['operator_token']}"}
+
+    # Fetch admin's own ID
+    me_resp = await raw_client.get("/auth/me", headers=admin_headers)
+    assert me_resp.status_code == 200
+    admin_id = me_resp.json()["id"]
+
+    # 1. Admin cannot self-demote
+    self_demote = await raw_client.patch(
+        f"/auth/users/{admin_id}",
+        json={"role": "operator"},
+        headers=admin_headers,
+    )
+    assert self_demote.status_code == 400
+    assert "cannot remove your own administrator role" in self_demote.json()["detail"]
+
+    # 2. Admin cannot self-deactivate
+    self_deact = await raw_client.patch(
+        f"/auth/users/{admin_id}",
+        json={"is_active": False},
+        headers=admin_headers,
+    )
+    assert self_deact.status_code == 400
+    assert "cannot disable your own account" in self_deact.json()["detail"]
+
+    # 3. Create a second user
+    create_res = await raw_client.post(
+        "/auth/users",
+        json={"username": "managed_user", "password": "InitialPassword123!", "role": "observer"},
+        headers=admin_headers,
+    )
+    assert create_res.status_code == 201
+    managed_id = create_res.json()["id"]
+
+    # Operator cannot patch user -> 403
+    op_patch = await raw_client.patch(
+        f"/auth/users/{managed_id}",
+        json={"role": "operator"},
+        headers=operator_headers,
+    )
+    assert op_patch.status_code == 403
+
+    # Admin can promote user to operator
+    promote_res = await raw_client.patch(
+        f"/auth/users/{managed_id}",
+        json={"role": "operator"},
+        headers=admin_headers,
+    )
+    assert promote_res.status_code == 200
+    assert promote_res.json()["role"] == "operator"
+
+    # Admin can update user's password (password reset)
+    pw_res = await raw_client.patch(
+        f"/auth/users/{managed_id}",
+        json={"password": "NewSecretPassword456!"},
+        headers=admin_headers,
+    )
+    assert pw_res.status_code == 200
+
+    # Admin can deactivate user
+    deact_res = await raw_client.patch(
+        f"/auth/users/{managed_id}",
+        json={"is_active": False},
+        headers=admin_headers,
+    )
+    assert deact_res.status_code == 200
+    assert deact_res.json()["is_active"] is False
+
+    # 4. Protection of last active admin:
+    # If a second admin is created, promoted, then demoted back when they are the only other admin
+    create_adm2 = await raw_client.post(
+        "/auth/users",
+        json={"username": "admin_two", "password": "PasswordAdmin2!", "role": "admin"},
+        headers=admin_headers,
+    )
+    assert create_adm2.status_code == 201
+    adm2_id = create_adm2.json()["id"]
+
+    # Demoting admin2 succeeds because admin1 is still active
+    demote_adm2 = await raw_client.patch(
+        f"/auth/users/{adm2_id}",
+        json={"role": "operator"},
+        headers=admin_headers,
+    )
+    assert demote_adm2.status_code == 200
+
+    # Now attempt to demote admin1: since admin1 is the only remaining active admin,
+    # the self-demotion check and last active admin checks trigger
+    demote_last = await raw_client.patch(
+        f"/auth/users/{admin_id}",
+        json={"role": "operator"},
+        headers=admin_headers,
+    )
+    assert demote_last.status_code == 400

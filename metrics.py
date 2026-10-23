@@ -266,7 +266,15 @@ def record_execution_transition(
     """Safely record an execution status transition and associated timings."""
     try:
         norm_status = _clean_str(status)
-        norm_cat = _clean_str(category)
+        # Category is user-configurable. Truncating strings does not bound the
+        # number of distinct Prometheus time series, so map unknown values to a
+        # fixed bucket to prevent cardinality attacks.
+        allowed_categories = {
+            "default", "standard", "batch", "etl", "bulk", "db-query",
+            "llm-calls", "other", "unknown",
+        }
+        candidate_category = _clean_str(category)
+        norm_cat = candidate_category if candidate_category in allowed_categories else "other"
         EXECUTIONS_TOTAL.labels(status=norm_status, category=norm_cat).inc()
 
         # Queue wait time on claim

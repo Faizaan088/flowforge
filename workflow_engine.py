@@ -355,11 +355,12 @@ async def create_workflow(
     edges: Sequence[tuple[str, str] | tuple[int, int] | WorkflowEdge] | None = None,
     description: str | None = None,
     validate: bool = True,
+    user_id: int | None = None,
 ) -> WorkflowDefinition:
     """
     Convenience function to create, persist, and optionally validate a workflow definition.
     """
-    workflow = WorkflowDefinition(name=name, description=description)
+    workflow = WorkflowDefinition(name=name, description=description, user_id=user_id)
     session.add(workflow)
     await session.flush()
 

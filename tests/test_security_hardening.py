@@ -52,6 +52,23 @@ def test_production_validation_rejects_default_secret_key():
             validate_production_configuration()
 
 
+def test_production_validation_rejects_secret_template_placeholder():
+    """A copied .env.example secret must not pass production validation."""
+    with patch.dict(
+        os.environ,
+        {
+            "ENVIRONMENT": "production",
+            "FLOWFORGE_SECRET_KEY": "replace-with-a-cryptographically-secure-random-secret-key-32-chars-min",
+            "FLOWFORGE_ADMIN_PASSWORD": "SecureAdminPassword2026!",
+            "CORS_ALLOWED_ORIGINS": "https://controlplane.example.com",
+            "DATABASE_URL": "postgresql+asyncpg://user:strong-pass@localhost:5432/db",
+        },
+        clear=False,
+    ):
+        with pytest.raises(ValueError, match="cannot use default or insecure value"):
+            validate_production_configuration()
+
+
 def test_production_validation_rejects_short_secret_key():
     """In production mode, secret key with fewer than 32 characters is rejected."""
     with patch.dict(
@@ -87,7 +104,7 @@ def test_production_validation_rejects_missing_admin_password():
 
 
 def test_production_validation_rejects_short_admin_password():
-    """In production mode, admin password under 8 characters is rejected."""
+    """In production mode, admin password under 12 characters is rejected."""
     with patch.dict(
         os.environ,
         {
@@ -99,7 +116,24 @@ def test_production_validation_rejects_short_admin_password():
         },
         clear=False,
     ):
-        with pytest.raises(ValueError, match="at least 8 characters long"):
+        with pytest.raises(ValueError, match="between 12 and 128 characters"):
+            validate_production_configuration()
+
+
+def test_production_validation_rejects_admin_password_template_placeholder():
+    """A copied .env.example admin password must not pass production validation."""
+    with patch.dict(
+        os.environ,
+        {
+            "ENVIRONMENT": "production",
+            "FLOWFORGE_SECRET_KEY": "a" * 32,
+            "FLOWFORGE_ADMIN_PASSWORD": "replace-with-a-strong-admin-password-min-8-chars",
+            "CORS_ALLOWED_ORIGINS": "https://controlplane.example.com",
+            "DATABASE_URL": "postgresql+asyncpg://user:strong-pass@localhost:5432/db",
+        },
+        clear=False,
+    ):
+        with pytest.raises(ValueError, match="cannot use a template placeholder"):
             validate_production_configuration()
 
 
@@ -134,6 +168,42 @@ def test_production_validation_rejects_missing_cors_in_prod():
             validate_production_configuration()
 
 
+def test_production_validation_rejects_default_db_password():
+    """In production mode, default database password 'flowforge_password' is rejected."""
+    with patch.dict(
+        os.environ,
+        {
+            "ENVIRONMENT": "production",
+            "FLOWFORGE_SECRET_KEY": "secure_production_secret_key_with_at_least_32_characters",
+            "FLOWFORGE_ADMIN_PASSWORD": "SecureAdminPassword2026!",
+            "CORS_ALLOWED_ORIGINS": "https://dashboard.example.com",
+            "DATABASE_URL": "postgresql+asyncpg://flowforge_user:flowforge_password@postgres:5432/flowforge",
+        },
+        clear=False,
+    ):
+        with pytest.raises(ValueError, match="unique database password is required"):
+            validate_production_configuration()
+
+
+def test_production_validation_rejects_unauthenticated_redis_when_auth_required():
+    """In production mode, if REQUIRE_REDIS_AUTH is enabled, REDIS_URL must specify credentials."""
+    with patch.dict(
+        os.environ,
+        {
+            "ENVIRONMENT": "production",
+            "FLOWFORGE_SECRET_KEY": "secure_production_secret_key_with_at_least_32_characters",
+            "FLOWFORGE_ADMIN_PASSWORD": "SecureAdminPassword2026!",
+            "CORS_ALLOWED_ORIGINS": "https://dashboard.example.com",
+            "DATABASE_URL": "postgresql+asyncpg://flowforge_user:abcdefghijklmnopqrstuvwx@postgres:5432/flowforge",
+            "REQUIRE_REDIS_AUTH": "true",
+            "REDIS_URL": "redis://redis:6379/0",
+        },
+        clear=False,
+    ):
+        with pytest.raises(ValueError, match="REDIS_URL must be a valid authenticated Redis URL"):
+            validate_production_configuration()
+
+
 def test_production_validation_succeeds_with_valid_settings():
     """In production mode, properly configured settings pass validation."""
     with patch.dict(
@@ -143,11 +213,14 @@ def test_production_validation_succeeds_with_valid_settings():
             "FLOWFORGE_SECRET_KEY": "secure_production_secret_key_with_at_least_32_characters",
             "FLOWFORGE_ADMIN_PASSWORD": "SecureAdminPassword2026!",
             "CORS_ALLOWED_ORIGINS": "https://dashboard.example.com,https://app.example.com",
-            "DATABASE_URL": "postgresql+asyncpg://flowforge_user:secret@postgres:5432/flowforge",
+            "DATABASE_URL": "postgresql+asyncpg://flowforge_user:abcdefghijklmnopqrstuvwx@postgres:5432/flowforge",
+            "REQUIRE_REDIS_AUTH": "true",
+            "REDIS_URL": "redis://:abcdefghijklmnopqrstuvwxyzABCDEF@redis:6379/0",
         },
         clear=False,
     ):
         validate_production_configuration()  # Must not raise
+
 
 
 def test_cors_origins_dev_defaults():
@@ -169,3 +242,64 @@ def test_cors_origins_custom_list():
     ):
         origins = get_cors_origins()
         assert origins == ["https://a.com", "https://b.com", "https://c.com"]
+
+
+def test_production_validation_rejects_http_cors_origins():
+    """Public production origins must use HTTPS."""
+    with patch.dict(
+        os.environ,
+        {
+            "ENVIRONMENT": "production",
+            "FLOWFORGE_SECRET_KEY": "s" * 64,
+            "FLOWFORGE_ADMIN_USERNAME": "admin",
+            "FLOWFORGE_ADMIN_PASSWORD": "SecureAdminPassword2026!",
+            "CORS_ALLOWED_ORIGINS": "http://dashboard.example.com",
+            "DATABASE_URL": "postgresql+asyncpg://flowforge_user:abcdefghijklmnopqrstuvwx@postgres:5432/flowforge",
+            "REQUIRE_REDIS_AUTH": "true",
+            "REDIS_URL": "redis://:abcdefghijklmnopqrstuvwxyzABCDEF@redis:6379/0",
+        },
+        clear=True,
+    ):
+        with pytest.raises(ValueError, match="production CORS origins must use HTTPS"):
+            validate_production_configuration()
+
+
+def test_production_validation_rejects_database_password_template():
+    """Long template placeholders must not be accepted as production passwords."""
+    placeholder = "replace-with-a-unique-url-safe-password-at-least-24-characters"
+    with patch.dict(
+        os.environ,
+        {
+            "ENVIRONMENT": "production",
+            "FLOWFORGE_SECRET_KEY": "s" * 64,
+            "FLOWFORGE_ADMIN_USERNAME": "admin",
+            "FLOWFORGE_ADMIN_PASSWORD": "SecureAdminPassword2026!",
+            "CORS_ALLOWED_ORIGINS": "https://dashboard.example.com",
+            "DATABASE_URL": f"postgresql+asyncpg://flowforge_user:{placeholder}@postgres:5432/flowforge",
+            "REQUIRE_REDIS_AUTH": "true",
+            "REDIS_URL": "redis://:abcdefghijklmnopqrstuvwxyzABCDEF@redis:6379/0",
+        },
+        clear=True,
+    ):
+        with pytest.raises(ValueError, match="POSTGRES_PASSWORD must be at least 24 URL-safe characters"):
+            validate_production_configuration()
+
+
+def test_production_validation_rejects_short_redis_password():
+    """Production Redis credentials must be long and URL-safe."""
+    with patch.dict(
+        os.environ,
+        {
+            "ENVIRONMENT": "production",
+            "FLOWFORGE_SECRET_KEY": "s" * 64,
+            "FLOWFORGE_ADMIN_USERNAME": "admin",
+            "FLOWFORGE_ADMIN_PASSWORD": "SecureAdminPassword2026!",
+            "CORS_ALLOWED_ORIGINS": "https://dashboard.example.com",
+            "DATABASE_URL": "postgresql+asyncpg://flowforge_user:abcdefghijklmnopqrstuvwx@postgres:5432/flowforge",
+            "REQUIRE_REDIS_AUTH": "true",
+            "REDIS_URL": "redis://:shortpassword@redis:6379/0",
+        },
+        clear=True,
+    ):
+        with pytest.raises(ValueError, match="REDIS_PASSWORD must be at least 32 URL-safe characters"):
+            validate_production_configuration()

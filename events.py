@@ -412,16 +412,19 @@ manager = WebSocketManager()
 # WebSocket Authentication Helper
 # ---------------------------------------------------------------------------
 async def authenticate_websocket(websocket: WebSocket, session: AsyncSession) -> Optional[User]:
-    """Authenticate WebSocket handshake from query parameters or Authorization header.
+    """Authenticate WebSocket handshake using Authorization or a subprotocol token.
 
-    Returns the authenticated User or None if unauthenticated.
+    Query-string token compatibility is limited to development because URLs may
+    be recorded in access logs. Returns the authenticated User or None.
     """
     token: Optional[str] = None
 
-    # 1. Query parameter: ?token=<jwt>
-    query_params = urllib.parse.parse_qs(websocket.scope.get("query_string", b"").decode("latin1"))
-    if "token" in query_params:
-        token = query_params["token"][0]
+    # Query-string tokens are retained only for local development compatibility.
+    # In production they are rejected because request URLs may be captured in logs.
+    if os.getenv("ENVIRONMENT", "development").lower() != "production":
+        query_params = urllib.parse.parse_qs(websocket.scope.get("query_string", b"").decode("latin1"))
+        if "token" in query_params:
+            token = query_params["token"][0]
 
     # 2. Authorization header if provided
     if not token:

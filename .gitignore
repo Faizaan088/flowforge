@@ -1,8 +1,22 @@
 .venv/
+venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.coverage
+coverage/
+*.log
+*.bak
+backups/
+*.sql
+*.sql.gz
 .env
 .env.*
 !.env.example
+!.env.production.example
 desktop.ini
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.eslintcache

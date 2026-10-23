@@ -41,7 +41,7 @@ This document details reproducible performance benchmarks measuring critical ope
 
 ### 2. Concurrent Worker Contention
 - **Mechanism**: 5 competing asynchronous worker loops contending on the same queue simultaneously.
-- **Result**: Zero duplicate claims; exactly 100 out of 100 executions claimed and fenced. PostgreSQL concurrency semantics guarantee exactly-once claim semantics without dual execution.
+- **Result**: In this benchmark run, zero duplicate claims were observed; all 100 of 100 executions were claimed and fenced. This result describes the tested concurrent-claim scenario only. `FOR UPDATE SKIP LOCKED` supports atomic row claiming among competing transactions, but does not prove exactly-once task execution or prevent repeated external side effects after crashes, lease expiry, or retries. Design handlers that call external systems to be idempotent or provide compensating actions.
 
 ### 3. Lease Recovery Latency (`recover_expired_executions`)
 - **Mechanism**: Bulk conditional SQL query identifying `status IN ('CLAIMED', 'RUNNING') AND lease_until <= now` and transitioning orphaned items to retry or failed state.

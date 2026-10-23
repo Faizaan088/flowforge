@@ -19,8 +19,24 @@ export type User = {
   email?: string | null;
   role: string;
   is_active: boolean;
+  is_verified?: boolean;
   created_at: string;
   updated_at: string;
+};
+
+export type ApiKey = {
+  id: number;
+  name: string;
+  key_prefix: string;
+  is_active: boolean;
+  created_at: string;
+  expires_at?: string | null;
+  last_used_at?: string | null;
+};
+
+export type ApiKeyCreated = {
+  api_key: ApiKey;
+  raw_key: string;
 };
 
 export type Execution = {
@@ -58,6 +74,26 @@ export type Worker = {
   created_at: string;
   last_heartbeat_at: string;
   is_alive: boolean;
+};
+
+export type Schedule = {
+  id: number;
+  name: string;
+  schedule_type: string;
+  enabled: boolean;
+  configuration?: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AuditEvent = {
+  id: number;
+  actor_id: string;
+  action: string;
+  target_type: string;
+  target_id?: string | null;
+  metadata_?: Record<string, unknown> | null;
+  created_at: string;
 };
 
 export type WorkflowTask = {
@@ -120,6 +156,48 @@ export async function login(username: string, password: string) {
 export function logout() {
   localStorage.removeItem("flowforge_token");
   localStorage.removeItem("flowforge_user");
+}
+
+export async function backendLogout() {
+  try {
+    await api.post("/auth/logout");
+  } catch {
+    // Ignore network or token expiration errors on logout
+  } finally {
+    logout();
+  }
+}
+
+export async function forgotPassword(emailOrUsername: string) {
+  return (await api.post("/auth/forgot-password", { email_or_username: emailOrUsername })).data;
+}
+
+export async function resetPassword(token: string, newPassword: string) {
+  return (await api.post("/auth/reset-password", { token, new_password: newPassword })).data;
+}
+
+export async function verifyEmail(token: string) {
+  return (await api.post("/auth/verify-email", { token })).data;
+}
+
+export async function resendVerification(email?: string) {
+  return (await api.post("/auth/resend-verification", { email })).data;
+}
+
+export async function deleteAccount(confirmUsername: string, password: string) {
+  return (await api.delete("/users/me", { data: { confirm_username: confirmUsername, password } })).data;
+}
+
+export async function listApiKeys() {
+  return (await api.get<ApiKey[]>("/api-keys/")).data;
+}
+
+export async function createApiKey(name: string, expiresInDays?: number) {
+  return (await api.post<ApiKeyCreated>("/api-keys/", { name, expires_in_days: expiresInDays })).data;
+}
+
+export async function revokeApiKey(id: number) {
+  return (await api.delete(`/api-keys/${id}`)).data;
 }
 
 export async function me() {
@@ -275,4 +353,51 @@ export async function reconcileQueue() {
 
 export async function systemSweep() {
   return (await api.post("/system/sweep")).data;
+}
+
+// ---------------------------------------------------------------------------
+// Schedules
+// ---------------------------------------------------------------------------
+export async function listSchedules() {
+  return (await api.get<Schedule[]>("/schedules/")).data;
+}
+
+export async function createSchedule(payload: {
+  name: string;
+  schedule_type: string;
+  enabled?: boolean;
+  configuration?: Record<string, unknown>;
+}) {
+  return (await api.post<Schedule>("/schedules/", payload)).data;
+}
+
+export async function updateSchedule(
+  id: number,
+  payload: { name?: string; enabled?: boolean; configuration?: Record<string, unknown> }
+) {
+  return (await api.patch<Schedule>(`/schedules/${id}`, payload)).data;
+}
+
+export async function deleteSchedule(id: number) {
+  return (await api.delete(`/schedules/${id}`)).data;
+}
+
+// ---------------------------------------------------------------------------
+// Audit & Workers
+// ---------------------------------------------------------------------------
+export async function listAuditEvents(params?: {
+  actor_id?: string;
+  action?: string;
+  target_type?: string;
+  limit?: number;
+}) {
+  return (await api.get<AuditEvent[]>("/audit/", { params })).data;
+}
+
+export async function disableWorker(workerId: string) {
+  return (await api.post<Worker>(`/workers/${workerId}/disable`)).data;
+}
+
+export async function enableWorker(workerId: string) {
+  return (await api.post<Worker>(`/workers/${workerId}/enable`)).data;
 }

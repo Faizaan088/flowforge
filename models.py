@@ -7,6 +7,7 @@ class JobDefinition(Base):
     __tablename__ = "job_definitions"
     
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     name = Column(String, index=True, nullable=False)
     
     payload = Column(JSON, nullable=True) 
@@ -70,6 +71,7 @@ class ScheduleDefinition(Base):
     __tablename__ = "schedule_definitions"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     name = Column(String, index=True, nullable=False)
     schedule_type = Column(String, nullable=False)
     enabled = Column(Boolean, default=True, server_default=expression.true(), nullable=False)
@@ -180,6 +182,7 @@ class WorkflowDefinition(Base):
     __tablename__ = "workflow_definitions"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     name = Column(String, nullable=False, index=True)
     description = Column(String, nullable=True)
     version = Column(Integer, default=1, nullable=False)
@@ -625,6 +628,9 @@ class User(Base):
     is_active = Column(
         Boolean, default=True, server_default=expression.true(), nullable=False
     )
+    is_verified = Column(
+        Boolean, default=False, server_default=expression.false(), nullable=False
+    )
     created_at = Column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -640,5 +646,75 @@ class User(Base):
             "role IN ('admin', 'operator', 'observer')",
             name="ck_users_role",
         ),
+    )
+
+
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token_hash = Column(String(255), unique=True, nullable=False, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    user = relationship("User", lazy="selectin")
+
+
+class EmailVerificationToken(Base):
+    __tablename__ = "email_verification_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token_hash = Column(String(255), unique=True, nullable=False, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    user = relationship("User", lazy="selectin")
+
+
+class ApiKey(Base):
+    __tablename__ = "api_keys"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name = Column(String(100), nullable=False)
+    key_prefix = Column(String(16), nullable=False, index=True)
+    key_hash = Column(String(255), nullable=False)
+    is_active = Column(
+        Boolean, default=True, server_default=expression.true(), nullable=False
+    )
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User", lazy="selectin")
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    actor_id = Column(String(100), nullable=False, index=True)
+    action = Column(String(100), nullable=False, index=True)
+    target_type = Column(String(100), nullable=False, index=True)
+    target_id = Column(String(100), nullable=True, index=True)
+    metadata_ = Column("metadata", JSON, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
 

@@ -1,6 +1,7 @@
 """Durable FlowForge Scheduler subsystem: evaluation, recurring generation, dispatch, and loop."""
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -10,6 +11,8 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import Execution, JobDefinition, ScheduleDefinition, ScheduleOccurrence
+
+logger = logging.getLogger("flowforge.scheduler")
 from queue_reconciliation import ReconciliationResult, deliver_executions_to_redis
 
 
@@ -295,7 +298,11 @@ async def evaluate_due_schedules(
             )
             if target_val is None:
                 continue
-            run_at = _parse_datetime(target_val)
+            try:
+                run_at = _parse_datetime(target_val)
+            except (TypeError, ValueError, OverflowError):
+                logger.warning("Skipping schedule %s: invalid one-time date configuration", schedule.id)
+                continue
             if eval_time < run_at:
                 continue  # Future; not yet due
 
@@ -332,9 +339,20 @@ async def evaluate_due_schedules(
             )
             if delay_sec is not None:
                 base_time = schedule.created_at or eval_time
-                due_time = base_time + timedelta(seconds=float(delay_sec))
+                try:
+                    delay_value = float(delay_sec)
+                    if not 0 <= delay_value <= 315360000:
+                        raise ValueError("delay outside supported range")
+                    due_time = base_time + timedelta(seconds=delay_value)
+                except (TypeError, ValueError, OverflowError):
+                    logger.warning("Skipping schedule %s: invalid delay configuration", schedule.id)
+                    continue
             elif cfg.get("run_at"):
-                due_time = _parse_datetime(cfg["run_at"])
+                try:
+                    due_time = _parse_datetime(cfg["run_at"])
+                except (TypeError, ValueError, OverflowError):
+                    logger.warning("Skipping schedule %s: invalid delayed date configuration", schedule.id)
+                    continue
             else:
                 continue
 
@@ -371,7 +389,12 @@ async def evaluate_due_schedules(
             # - "catch_up" (default): Deterministically evaluate and generate each missed occurrence up to `max_missed_occurrences` (default: 50).
             # - "skip" / "coalesce": Skip intermediate missed occurrences and generate only the single latest due occurrence.
             misfire_policy = str(cfg.get("misfire_policy", "catch_up")).lower()
-            max_missed = int(cfg.get("max_missed_occurrences", 50))
+            try:
+                max_missed = int(cfg.get("max_missed_occurrences", 50))
+            except (TypeError, ValueError, OverflowError):
+                logger.warning("Invalid max_missed_occurrences for schedule %s; using 50", schedule.id)
+                max_missed = 50
+            max_missed = max(1, min(max_missed, 1000))
 
             latest_time = await session.scalar(
                 select(func.max(ScheduleOccurrence.scheduled_for)).where(

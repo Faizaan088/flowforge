@@ -26,13 +26,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
-from models import User
+from models import User, PasswordResetToken, EmailVerificationToken, ApiKey
+from config import safe_int
+from email_service import send_password_reset_email, send_verification_email
 
 # ---------------------------------------------------------------------------
 # Configuration & Constants
 # ---------------------------------------------------------------------------
 SECRET_KEY = os.getenv("FLOWFORGE_SECRET_KEY", "flowforge-dev-secret-key-change-in-production")
-TOKEN_EXPIRE_MINUTES = int(os.getenv("FLOWFORGE_TOKEN_EXPIRE_MINUTES", "60"))
+TOKEN_EXPIRE_MINUTES = safe_int(os.getenv("FLOWFORGE_TOKEN_EXPIRE_MINUTES", "60"), 60)
 ADMIN_USERNAME = os.getenv("FLOWFORGE_ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("FLOWFORGE_ADMIN_PASSWORD")
 
@@ -88,6 +90,7 @@ class UserResponse(BaseModel):
     email: Optional[str] = None
     role: str
     is_active: bool
+    is_verified: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -96,7 +99,7 @@ class UserResponse(BaseModel):
 
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=1, max_length=100)
-    password: str = Field(..., min_length=4)
+    password: str = Field(..., min_length=12, max_length=128)
     email: Optional[str] = None
     role: str = ROLE_OBSERVER
 
@@ -104,7 +107,7 @@ class UserCreate(BaseModel):
 class UserUpdate(BaseModel):
     role: Optional[str] = None
     is_active: Optional[bool] = None
-    password: Optional[str] = Field(default=None, min_length=4)
+    password: Optional[str] = Field(default=None, min_length=12, max_length=128)
 
 
 class LoginRequest(BaseModel):
@@ -116,6 +119,50 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserResponse
+
+
+class ForgotPasswordRequest(BaseModel):
+    email_or_username: str = Field(..., min_length=1, max_length=255)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(..., min_length=10)
+    new_password: str = Field(..., min_length=12, max_length=128)
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(..., min_length=10)
+
+
+class ResendVerificationRequest(BaseModel):
+    email: Optional[str] = None
+
+
+class ApiKeyCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    expires_in_days: Optional[int] = None
+
+
+class ApiKeyResponse(BaseModel):
+    id: int
+    name: str
+    key_prefix: str
+    is_active: bool
+    created_at: datetime
+    expires_at: Optional[datetime] = None
+    last_used_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ApiKeyCreatedResponse(BaseModel):
+    api_key: ApiKeyResponse
+    raw_key: str
+
+
+class AccountDeleteRequest(BaseModel):
+    confirm_username: str
+    password: str
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +321,22 @@ async def get_user_by_username(session: AsyncSession, username: str) -> Optional
     return result.scalar_one_or_none()
 
 
+async def get_user_by_email(session: AsyncSession, email: str) -> Optional[User]:
+    """Retrieve a user by unique email."""
+    stmt = select(User).where(User.email == email.strip())
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def get_user_by_email_or_username(session: AsyncSession, identifier: str) -> Optional[User]:
+    """Retrieve a user by email or username."""
+    clean = identifier.strip()
+    user = await get_user_by_username(session, clean)
+    if user is not None:
+        return user
+    return await get_user_by_email(session, clean)
+
+
 async def list_users(session: AsyncSession) -> list[User]:
     """List all registered users ordered by ID."""
     stmt = select(User).order_by(User.id.asc())
@@ -393,18 +456,298 @@ async def bootstrap_admin(session: AsyncSession) -> Optional[User]:
         print(f"Bootstrapped administrator account '{admin_user}'")
         return user
     else:
-        # Ensure role is admin and active
-        updated = False
-        if user.role != ROLE_ADMIN:
-            user.role = ROLE_ADMIN
-            updated = True
-        if not user.is_active:
-            user.is_active = True
-            updated = True
-        if updated:
-            await session.commit()
-            await session.refresh(user)
+        # Bootstrap is create-only: never silently undo an administrator's
+        # deliberate role, activation, or password changes on application restart.
         return user
+
+
+# ---------------------------------------------------------------------------
+# Token Revocation & Session Management
+# ---------------------------------------------------------------------------
+_local_revoked_tokens: set[str] = set()
+
+
+def get_redis_client():
+    r_url = os.getenv("REDIS_URL")
+    if r_url:
+        try:
+            import redis
+            return redis.from_url(r_url, decode_responses=True)
+        except Exception:
+            return None
+    return None
+
+
+def revoke_token(token: str, expires_in_seconds: int = 3600) -> None:
+    """Revoke a token locally and in Redis (if configured)."""
+    _local_revoked_tokens.add(token)
+    r = get_redis_client()
+    if r:
+        try:
+            r.setex(f"flowforge:revoked_token:{token}", expires_in_seconds, "1")
+        except Exception:
+            pass
+
+
+def is_token_revoked(token: str) -> bool:
+    """Check whether a token has been revoked."""
+    if token in _local_revoked_tokens:
+        return True
+    r = get_redis_client()
+    if r:
+        try:
+            return bool(r.exists(f"flowforge:revoked_token:{token}"))
+        except Exception:
+            pass
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Password Reset & Email Verification Services
+# ---------------------------------------------------------------------------
+async def request_password_reset(
+    session: AsyncSession,
+    email_or_username: str,
+    base_url: str = "http://localhost:5173",
+) -> bool:
+    """Initiate a password reset request. Always returns True to prevent enumeration."""
+    user = await get_user_by_email_or_username(session, email_or_username)
+    if not user:
+        return True
+
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    record = PasswordResetToken(
+        user_id=user.id,
+        token_hash=token_hash,
+        expires_at=expires_at,
+    )
+    session.add(record)
+    await session.flush()
+
+    recipient_email = user.email or f"{user.username}@localhost"
+    reset_url = f"{base_url.rstrip('/')}/reset-password?token={raw_token}"
+    send_password_reset_email(
+        to_email=recipient_email,
+        username=user.username,
+        reset_url=reset_url,
+        token=raw_token,
+    )
+    return True
+
+
+async def reset_password_with_token(
+    session: AsyncSession,
+    token: str,
+    new_password: str,
+) -> User:
+    """Reset a user's password using a valid, unused password reset token."""
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    stmt = (
+        select(PasswordResetToken)
+        .where(
+            PasswordResetToken.token_hash == token_hash,
+            PasswordResetToken.used_at.is_(None),
+            PasswordResetToken.expires_at > datetime.now(timezone.utc),
+        )
+    )
+    result = await session.execute(stmt)
+    record = result.scalar_one_or_none()
+    if record is None:
+        raise ValueError("Invalid or expired password reset token")
+
+    record.used_at = datetime.now(timezone.utc)
+    user = await session.get(User, record.user_id)
+    if user is None:
+        raise ValueError("User associated with token not found")
+
+    user.password_hash = hash_password(new_password)
+    await session.flush()
+    return user
+
+
+async def create_email_verification_token(
+    session: AsyncSession,
+    user: User,
+    base_url: str = "http://localhost:5173",
+) -> str:
+    """Generate and record an email verification token, then send the verification email."""
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=1)
+
+    record = EmailVerificationToken(
+        user_id=user.id,
+        token_hash=token_hash,
+        expires_at=expires_at,
+    )
+    session.add(record)
+    await session.flush()
+
+    recipient_email = user.email or f"{user.username}@localhost"
+    verification_url = f"{base_url.rstrip('/')}/verify-email?token={raw_token}"
+    send_verification_email(
+        to_email=recipient_email,
+        username=user.username,
+        verification_url=verification_url,
+        token=raw_token,
+    )
+    return raw_token
+
+
+async def verify_email_with_token(
+    session: AsyncSession,
+    token: str,
+) -> User:
+    """Mark a user's email as verified using a valid verification token."""
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    stmt = (
+        select(EmailVerificationToken)
+        .where(
+            EmailVerificationToken.token_hash == token_hash,
+            EmailVerificationToken.used_at.is_(None),
+            EmailVerificationToken.expires_at > datetime.now(timezone.utc),
+        )
+    )
+    result = await session.execute(stmt)
+    record = result.scalar_one_or_none()
+    if record is None:
+        raise ValueError("Invalid or expired email verification token")
+
+    record.used_at = datetime.now(timezone.utc)
+    user = await session.get(User, record.user_id)
+    if user is None:
+        raise ValueError("User associated with token not found")
+
+    user.is_verified = True
+    await session.flush()
+    return user
+
+
+# ---------------------------------------------------------------------------
+# API Key Management & Authentication
+# ---------------------------------------------------------------------------
+async def create_api_key(
+    session: AsyncSession,
+    user_id: int,
+    name: str,
+    expires_in_days: Optional[int] = None,
+) -> tuple[ApiKey, str]:
+    """Generate a cryptographically random API key and persist its prefix and hash."""
+    clean_name = name.strip()
+    if not clean_name:
+        raise ValueError("API key name cannot be empty")
+
+    raw_key = f"ffk_{secrets.token_urlsafe(32)}"
+    key_prefix = raw_key[:12]
+    key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(days=expires_in_days)
+        if expires_in_days is not None and expires_in_days > 0
+        else None
+    )
+
+    api_key = ApiKey(
+        user_id=user_id,
+        name=clean_name,
+        key_prefix=key_prefix,
+        key_hash=key_hash,
+        expires_at=expires_at,
+        is_active=True,
+    )
+    session.add(api_key)
+    await session.flush()
+    return api_key, raw_key
+
+
+async def authenticate_api_key(
+    session: AsyncSession,
+    raw_key: str,
+) -> Optional[User]:
+    """Authenticate an incoming API key against stored cryptographic hashes."""
+    if not raw_key or not raw_key.startswith("ffk_"):
+        return None
+
+    key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc)
+    stmt = (
+        select(ApiKey)
+        .where(
+            ApiKey.key_hash == key_hash,
+            ApiKey.is_active.is_(True),
+        )
+    )
+    result = await session.execute(stmt)
+    api_key = result.scalar_one_or_none()
+    if api_key is None:
+        return None
+
+    if api_key.expires_at is not None and api_key.expires_at < now:
+        return None
+
+    api_key.last_used_at = now
+    await session.flush()
+
+    user = await session.get(User, api_key.user_id)
+    if user is None or not user.is_active:
+        return None
+
+    return user
+
+
+async def list_api_keys(
+    session: AsyncSession,
+    user_id: int,
+) -> list[ApiKey]:
+    """List all active API keys for a user."""
+    stmt = (
+        select(ApiKey)
+        .where(ApiKey.user_id == user_id, ApiKey.is_active.is_(True))
+        .order_by(ApiKey.created_at.desc())
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def revoke_api_key(
+    session: AsyncSession,
+    user_id: int,
+    key_id: int,
+) -> bool:
+    """Revoke an API key belonging to the user."""
+    stmt = select(ApiKey).where(ApiKey.id == key_id, ApiKey.user_id == user_id)
+    result = await session.execute(stmt)
+    api_key = result.scalar_one_or_none()
+    if api_key is None or not api_key.is_active:
+        return False
+    api_key.is_active = False
+    await session.flush()
+    return True
+
+
+async def delete_user_account(
+    session: AsyncSession,
+    user_id: int,
+) -> bool:
+    """Delete a user account and associated personal tokens."""
+    user = await session.get(User, user_id)
+    if user is None:
+        return False
+
+    if user.role == ROLE_ADMIN and user.is_active:
+        active_admins_stmt = select(User).where(
+            User.role == ROLE_ADMIN,
+            User.is_active.is_(True),
+        )
+        admins = (await session.execute(active_admins_stmt)).scalars().all()
+        if len(admins) <= 1:
+            raise ValueError("Cannot delete the last active administrator account")
+
+    await session.delete(user)
+    await session.flush()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -414,10 +757,22 @@ async def get_current_user(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Extract and authenticate the principal from the Authorization header.
+    """Extract and authenticate the principal from Authorization or X-API-Key header.
 
-    Returns the verified User model. Raises HTTP 401 on missing/invalid/expired token or disabled user.
+    Returns the verified User model. Raises HTTP 401 on missing/invalid/expired token/key or disabled user.
     """
+    # Check for API key in X-API-Key header
+    api_key_header = request.headers.get("X-API-Key") or request.headers.get("x-api-key")
+    if api_key_header:
+        user = await authenticate_api_key(db, api_key_header.strip())
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired API key",
+                headers={"WWW-Authenticate": "ApiKey"},
+            )
+        return user
+
     auth_header = request.headers.get("Authorization")
     if not auth_header:
         raise HTTPException(
@@ -435,6 +790,13 @@ async def get_current_user(
         )
 
     token = parts[1]
+    if is_token_revoked(token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     payload = decode_access_token(token)
 
     user_id_str = payload.get("sub")
