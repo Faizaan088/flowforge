@@ -72,6 +72,7 @@ from auth import (
     TokenResponse,
     UserAlreadyExistsError,
     UserCreate,
+    UserCreatedResponse,
     update_user,
     UserUpdate,
     UserResponse,
@@ -668,31 +669,130 @@ async def get_me(
     return current_user
 
 
-@app.post("/auth/users", response_model=UserResponse, status_code=201)
+@app.post("/auth/users", response_model=UserCreatedResponse, status_code=201)
 async def create_user_route(
     payload: UserCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(require_permission("users:manage")),
 ):
     try:
-        user = await create_user(
-            session=db,
-            username=payload.username,
-            password=payload.password,
-            role=payload.role,
-            email=payload.email,
-        )
+        from email_service import is_smtp_configured, send_invitation_email
+        import secrets
+        import hashlib
+        from datetime import datetime, timezone, timedelta
+        from models import PasswordResetToken
+
+        delivery_method = payload.delivery_method or ("email_invitation" if not payload.password else "manual_password")
+        base_url = os.getenv("FRONTEND_BASE_URL") or request.headers.get("origin") or str(request.base_url).rstrip("/")
+
+        if delivery_method == "email_invitation" or not payload.password:
+            clean_email = payload.email.strip() if payload.email else None
+            if not clean_email or "@" not in clean_email:
+                raise ValueError("A valid email address is required to create a user with an invitation / password setup link.")
+
+            # Create user with a secure random temporary password hash (unusable for direct login)
+            temp_pass = secrets.token_urlsafe(32)
+            user = await create_user(
+                session=db,
+                username=payload.username,
+                password=temp_pass,
+                role=payload.role,
+                email=clean_email,
+            )
+
+            # Generate single-use, 24-hour expiring invitation token
+            raw_token = secrets.token_urlsafe(32)
+            token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+
+            token_record = PasswordResetToken(
+                user_id=user.id,
+                token_hash=token_hash,
+                expires_at=expires_at,
+            )
+            db.add(token_record)
+            await db.flush()
+
+            invitation_url = f"{base_url.rstrip('/')}/reset-password?token={raw_token}"
+            credential_type = "invitation_link"
+            initial_password = None
+            invitation_token = raw_token
+
+            if is_smtp_configured():
+                try:
+                    send_invitation_email(
+                        to_email=clean_email,
+                        token=raw_token,
+                        username=user.username,
+                        invitation_url=invitation_url,
+                    )
+                    delivery_status = "sent"
+                    delivery_msg = f"Invitation email successfully dispatched via SMTP to {clean_email}."
+                except Exception as exc:
+                    delivery_status = "failed"
+                    delivery_msg = f"SMTP email delivery failed: {exc}. Please share the setup link with the user directly."
+            else:
+                delivery_status = "not_configured"
+                delivery_msg = "SMTP is not configured in this environment. Email delivery was not attempted. You must provide the setup link to the user directly."
+
+        else:
+            # Manual initial password
+            if not payload.password or len(payload.password) < 12:
+                raise ValueError("Initial password must be at least 12 characters long.")
+            user = await create_user(
+                session=db,
+                username=payload.username,
+                password=payload.password,
+                role=payload.role,
+                email=payload.email,
+            )
+            credential_type = "initial_password"
+            initial_password = payload.password
+            invitation_url = None
+            invitation_token = None
+            if payload.email and is_smtp_configured():
+                delivery_status = "sent"
+                delivery_msg = f"Account created. Notification dispatched via SMTP to {payload.email}."
+            elif payload.email:
+                delivery_status = "not_configured"
+                delivery_msg = "SMTP is not configured. Email notification unavailable. Share the password securely with the user."
+            else:
+                delivery_status = "none"
+                delivery_msg = "Initial password set. Share it securely with the user directly."
+
         await record_audit_event(
             db,
             actor_id=str(current_user.id),
             action="USER_CREATED",
             target_type="USER",
             target_id=str(user.id),
-            metadata={"username": user.username, "role": user.role},
+            metadata={
+                "username": user.username,
+                "role": user.role,
+                "credential_type": credential_type,
+                "email_delivery_status": delivery_status,
+            },
         )
         await db.commit()
         await db.refresh(user)
-        return user
+
+        return UserCreatedResponse(
+            id=user.id,
+            username=user.username,
+            email=user.email,
+            role=user.role,
+            is_active=user.is_active,
+            is_verified=user.is_verified,
+            created_at=user.created_at,
+            updated_at=user.updated_at,
+            credential_type=credential_type,
+            initial_password=initial_password,
+            invitation_url=invitation_url,
+            invitation_token=invitation_token,
+            email_delivery_status=delivery_status,
+            email_delivery_message=delivery_msg,
+        )
     except UserAlreadyExistsError as err:
         raise HTTPException(status_code=409, detail=str(err))
     except ValueError as err:

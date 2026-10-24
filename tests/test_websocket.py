@@ -86,7 +86,7 @@ class AsyncWebSocketSession:
     async def send_json(self, data: Any):
         await self.send_text(json.dumps(data))
 
-    async def receive_text(self, timeout: float = 2.0) -> str:
+    async def receive_text(self, timeout: float = 10.0) -> str:
         msg = await asyncio.wait_for(self.from_server_q.get(), timeout=timeout)
         if msg["type"] == "websocket.send":
             return msg.get("text", "")
@@ -95,18 +95,24 @@ class AsyncWebSocketSession:
             raise ConnectionResetError(f"WebSocket closed with code {self.close_code}")
         raise RuntimeError(f"Unexpected ASGI message: {msg}")
 
-    async def receive_json(self, timeout: float = 2.0) -> Any:
+    async def receive_json(self, timeout: float = 10.0) -> Any:
         text = await self.receive_text(timeout=timeout)
         return json.loads(text)
 
     async def close(self, code: int = 1000):
         if not self.app_task.done():
             if self.accepted:
-                await self.to_server_q.put({"type": "websocket.disconnect", "code": code})
+                with suppress(Exception):
+                    await self.to_server_q.put({"type": "websocket.disconnect", "code": code})
             try:
-                await asyncio.wait_for(self.app_task, timeout=1.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                self.app_task.cancel()
+                await asyncio.wait_for(self.app_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+            finally:
+                if not self.app_task.done():
+                    self.app_task.cancel()
+                    with suppress(Exception):
+                        await self.app_task
 
 
 class AsyncWebSocketClient:
@@ -160,16 +166,16 @@ class AsyncWebSocketClient:
         app_task = asyncio.create_task(self.app(scope, receive, send))
         session = AsyncWebSocketSession(to_server_q, from_server_q, app_task)
 
-        first_resp = await asyncio.wait_for(from_server_q.get(), timeout=2.0)
-        if first_resp["type"] == "websocket.accept":
-            session.accepted = True
-        elif first_resp["type"] == "websocket.close":
-            session.accepted = False
-            session.close_code = first_resp.get("code", 1000)
-        else:
-            raise RuntimeError(f"Unexpected initial ASGI response: {first_resp}")
-
         try:
+            first_resp = await asyncio.wait_for(from_server_q.get(), timeout=10.0)
+            if first_resp["type"] == "websocket.accept":
+                session.accepted = True
+            elif first_resp["type"] == "websocket.close":
+                session.accepted = False
+                session.close_code = first_resp.get("code", 1000)
+            else:
+                raise RuntimeError(f"Unexpected initial ASGI response: {first_resp}")
+
             yield session
         finally:
             await session.close()

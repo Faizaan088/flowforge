@@ -208,8 +208,23 @@ export async function listUsers() {
   return (await api.get<User[]>("/auth/users")).data;
 }
 
-export async function createUser(payload: { username: string; password: string; email?: string; role: string }) {
-  return (await api.post<User>("/auth/users", payload)).data;
+export type UserCreatedResponse = User & {
+  credential_type: "initial_password" | "invitation_link";
+  initial_password?: string | null;
+  invitation_url?: string | null;
+  invitation_token?: string | null;
+  email_delivery_status: "sent" | "not_configured" | "failed" | "none";
+  email_delivery_message: string;
+};
+
+export async function createUser(payload: {
+  username: string;
+  password?: string;
+  email?: string;
+  role: string;
+  delivery_method?: "manual_password" | "email_invitation";
+}) {
+  return (await api.post<UserCreatedResponse>("/auth/users", payload)).data;
 }
 
 

@@ -1,7 +1,7 @@
 """Email delivery service for FlowForge.
 
-Supports SMTP with TLS/SSL if configured in environment, with safe fallback
-and logging for development/testing environments.
+Supports real SMTP with TLS/SSL when configured via environment variables,
+with clearly identified development fallback logging for testing environments.
 """
 
 from __future__ import annotations
@@ -14,13 +14,15 @@ from typing import List, Optional
 
 logger = logging.getLogger("flowforge.email")
 
-# In-memory history for local development/testing inspection
+# In-memory history for local development/testing inspection only
 _RECENT_DISPATCHED_EMAILS: List[dict] = []
 
 
 def is_smtp_configured() -> bool:
-    """Return True if required SMTP settings are present."""
-    return bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_FROM"))
+    """Return True if required SMTP settings are present and non-empty."""
+    host = os.getenv("SMTP_HOST")
+    from_addr = os.getenv("SMTP_FROM")
+    return bool(host and host.strip() and from_addr and from_addr.strip())
 
 
 def get_recent_emails() -> List[dict]:
@@ -46,7 +48,7 @@ def send_email(
     html_content: Optional[str] = None,
     metadata: Optional[dict] = None,
 ) -> bool:
-    """Send an email using SMTP if configured, or record it in development buffer.
+    """Send an email using real SMTP if configured, or record it in development buffer.
 
     Raises RuntimeError if SMTP is explicitly configured but delivery fails.
     """
@@ -54,25 +56,34 @@ def send_email(
     if not to_email:
         raise ValueError("Recipient email cannot be empty")
 
+    smtp_host = (os.getenv("SMTP_HOST") or "").strip()
+    smtp_from = (os.getenv("SMTP_FROM") or "no-reply@flowforge.dev").strip()
+    smtp_port_raw = os.getenv("SMTP_PORT", "587")
+    try:
+        smtp_port = int(float(str(smtp_port_raw).strip()))
+    except (ValueError, TypeError):
+        smtp_port = 587
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_pass = os.getenv("SMTP_PASSWORD")
+    smtp_tls = os.getenv("SMTP_TLS", "true").lower() in ("true", "1", "yes")
+
+    is_configured = bool(smtp_host and smtp_from)
+
     record = {
         "to": to_email,
         "subject": subject,
         "text": text_content,
         "html": html_content,
         "metadata": metadata or {},
+        "simulated": not is_configured,
+        "delivery_mode": "smtp" if is_configured else "dev_fallback",
     }
     _RECENT_DISPATCHED_EMAILS.append(record)
 
-    smtp_host = os.getenv("SMTP_HOST")
-    smtp_from = os.getenv("SMTP_FROM", "no-reply@flowforge.dev")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_pass = os.getenv("SMTP_PASSWORD")
-    smtp_tls = os.getenv("SMTP_TLS", "true").lower() in ("true", "1", "yes")
-
-    if not smtp_host:
+    if not is_configured:
+        # Development fallback: never claim real delivery occurred
         logger.info(
-            "SMTP not configured; recorded email to '%s' with subject '%s'",
+            "[DEV-ONLY FALLBACK] Real SMTP not configured; recorded simulated email to '%s' with subject '%s'",
             to_email,
             subject,
         )
@@ -171,6 +182,42 @@ def send_verification_email(
         </a>
       </p>
       <p style="font-size: 12px; color: #64748b;">This link expires in 24 hours.</p>
+    </div>
+    """
+    return send_email(to_email, subject, text, html, metadata={"token": token, "username": username, "url": link})
+
+
+def send_invitation_email(
+    to_email: str,
+    token: str,
+    frontend_url: Optional[str] = None,
+    username: Optional[str] = None,
+    invitation_url: Optional[str] = None,
+    **kwargs,
+) -> bool:
+    """Send an onboarding invitation link for a new user to set their password."""
+    base_url = frontend_url or os.getenv("FRONTEND_BASE_URL", "http://localhost:3000")
+    link = invitation_url or f"{base_url.rstrip('/')}/reset-password?token={token}"
+    user_display = username or "User"
+    subject = "Welcome to FlowForge — Complete Your Account Setup"
+    text = (
+        f"Hello {user_display},\n\n"
+        f"An administrator has created an account for you on FlowForge.\n\n"
+        f"Click the link below to set your password and complete onboarding (valid for 24 hours):\n"
+        f"{link}\n\n"
+        f"If you were not expecting this invitation, you can safely ignore this email.\n"
+    )
+    html = f"""
+    <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+      <h2 style="color: #06b6d4;">Welcome to FlowForge</h2>
+      <p>Hello {user_display},</p>
+      <p>An administrator has created an account for you on FlowForge. Please set your password to activate your access:</p>
+      <p>
+        <a href="{link}" style="display: inline-block; background-color: #06b6d4; color: #020617; padding: 10px 20px; text-decoration: none; border-radius: 8px; font-weight: bold;">
+          Set Account Password
+        </a>
+      </p>
+      <p style="font-size: 12px; color: #64748b;">This invitation link is single-use and expires in 24 hours.</p>
     </div>
     """
     return send_email(to_email, subject, text, html, metadata={"token": token, "username": username, "url": link})

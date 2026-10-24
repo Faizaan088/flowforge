@@ -191,3 +191,28 @@ def validate_production_configuration() -> None:
         raise ValueError(
             "CRITICAL SECURITY CONFIGURATION ERROR: production CORS origins must use HTTPS."
         )
+
+    # 6. Validate Email / SMTP Configuration (if required or configured)
+    require_smtp = os.getenv("REQUIRE_SMTP", "false").lower() in ("true", "1", "yes")
+    smtp_host = os.getenv("SMTP_HOST", "").strip()
+    if require_smtp and not smtp_host:
+        raise ValueError(
+            "CRITICAL SECURITY CONFIGURATION ERROR: REQUIRE_SMTP is enabled but SMTP_HOST is not configured in production."
+        )
+
+    if smtp_host:
+        smtp_from = os.getenv("SMTP_FROM", "").strip()
+        if not smtp_from or "@" not in smtp_from:
+            raise ValueError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: SMTP_FROM must be a valid email address when SMTP is configured in production."
+            )
+        smtp_port = safe_int(os.getenv("SMTP_PORT", "587"), 587)
+        if smtp_port not in (25, 465, 587, 2525):
+            raise ValueError(
+                f"CRITICAL SECURITY CONFIGURATION ERROR: Invalid SMTP_PORT {smtp_port} in production. Must be 25, 465, 587, or 2525."
+            )
+        smtp_pass = os.getenv("SMTP_PASSWORD", "")
+        if smtp_pass and smtp_pass.lower().startswith(("replace-with", "change-me", "changeme", "your-password")):
+            raise ValueError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: SMTP_PASSWORD cannot use a template placeholder in production."
+            )

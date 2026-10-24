@@ -80,6 +80,7 @@ import {
   type Execution,
   type Policy,
   type User,
+  type UserCreatedResponse,
   type Worker,
   type WorkflowDefinition,
   type WorkflowRun,
@@ -879,7 +880,7 @@ function Layout({
         }`}
       >
         <div className="flex items-center justify-between px-3 py-3">
-          <NavLink to="/" className="flex items-center gap-2 hover:opacity-90 transition-opacity">
+          <NavLink to="/" onClick={() => setMobile(false)} className="flex items-center gap-2 hover:opacity-90 transition-opacity">
             <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-cyan-500/20 text-cyan-400 border border-cyan-500/30">
               <Network size={18} />
             </span>
@@ -2664,6 +2665,9 @@ const [editPassword, setEditPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [newEmail, setNewEmail] = useState("");
   const [newRole, setNewRole] = useState("operator");
+  const [deliveryMethod, setDeliveryMethod] = useState<"manual_password" | "email_invitation">("manual_password");
+  const [createdResult, setCreatedResult] = useState<UserCreatedResponse | null>(null);
+  const [copiedCredential, setCopiedCredential] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -2686,21 +2690,42 @@ const [editPassword, setEditPassword] = useState("");
 
   async function handleCreateUser(e: React.FormEvent) {
     e.preventDefault();
+    if (deliveryMethod === "manual_password" && newPassword.length < 12) {
+      alert("Password must be at least 12 characters long.");
+      return;
+    }
+    if (deliveryMethod === "email_invitation" && !newEmail) {
+      alert("A valid email address is required to generate an invitation link.");
+      return;
+    }
+
     setBusy(true);
     try {
-      await createUser({
+      const res = await createUser({
         username: newUsername,
-        password: newPassword,
+        password: deliveryMethod === "manual_password" ? newPassword : undefined,
         email: newEmail || undefined,
         role: newRole,
+        delivery_method: deliveryMethod,
       });
       setAddModal(false);
       setNewUsername("");
       setNewPassword("");
       setNewEmail("");
+      setCreatedResult(res);
       loadAll();
     } catch (err: unknown) {
-      alert("Failed to create user: " + (err instanceof Error ? err.message : String(err)));
+      const detail =
+        typeof err === "object" &&
+        err !== null &&
+        "response" in err
+          ? (
+              err as {
+                response?: { data?: { detail?: string } };
+              }
+            ).response?.data?.detail
+          : undefined;
+      alert("Failed to create user: " + (detail || (err instanceof Error ? err.message : String(err))));
     } finally {
       setBusy(false);
     }
@@ -2850,6 +2875,36 @@ const [editPassword, setEditPassword] = useState("");
       {/* Create User Modal */}
       <Modal title="Create New Operator / User" isOpen={addModal} onClose={() => setAddModal(false)}>
         <form onSubmit={handleCreateUser} className="space-y-4">
+          <div>
+            <span className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Credential Setup Method</span>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setDeliveryMethod("manual_password")}
+                className={`rounded-xl border p-3 text-left text-xs transition ${
+                  deliveryMethod === "manual_password"
+                    ? "border-cyan-500 bg-cyan-500/10 text-cyan-300 font-semibold"
+                    : "border-slate-800 bg-slate-900/60 text-slate-400 hover:border-slate-700"
+                }`}
+              >
+                <div className="font-medium text-white mb-0.5">Initial Password</div>
+                <div className="text-[11px] text-slate-400">Set a temporary initial password</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => setDeliveryMethod("email_invitation")}
+                className={`rounded-xl border p-3 text-left text-xs transition ${
+                  deliveryMethod === "email_invitation"
+                    ? "border-cyan-500 bg-cyan-500/10 text-cyan-300 font-semibold"
+                    : "border-slate-800 bg-slate-900/60 text-slate-400 hover:border-slate-700"
+                }`}
+              >
+                <div className="font-medium text-white mb-0.5">Email Invitation</div>
+                <div className="text-[11px] text-slate-400">Send single-use setup link (24h)</div>
+              </button>
+            </div>
+          </div>
+
           <label className="block text-sm font-medium text-slate-300">
             Username
             <input
@@ -2860,27 +2915,34 @@ const [editPassword, setEditPassword] = useState("");
               className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 text-slate-100 outline-none focus:border-cyan-500"
             />
           </label>
+
+          {deliveryMethod === "manual_password" && (
+            <label className="block text-sm font-medium text-slate-300">
+              Initial Password (minimum 12 characters)
+              <input
+                required
+                type="password"
+                minLength={12}
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                placeholder="••••••••••••"
+                className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 text-slate-100 outline-none focus:border-cyan-500"
+              />
+            </label>
+          )}
+
           <label className="block text-sm font-medium text-slate-300">
-            Password
-            <input
-              required
-              type="password"
-              value={newPassword}
-              onChange={(e) => setNewPassword(e.target.value)}
-              placeholder="••••••••"
-              className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 text-slate-100 outline-none focus:border-cyan-500"
-            />
-          </label>
-          <label className="block text-sm font-medium text-slate-300">
-            Email (Optional)
+            Email {deliveryMethod === "email_invitation" ? "(Required for Invitation)" : "(Optional)"}
             <input
               type="email"
+              required={deliveryMethod === "email_invitation"}
               value={newEmail}
               onChange={(e) => setNewEmail(e.target.value)}
               placeholder="ops@flowforge.dev"
               className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 text-slate-100 outline-none focus:border-cyan-500"
             />
           </label>
+
           <label className="block text-sm font-medium text-slate-300">
             Role
             <select
@@ -2893,6 +2955,7 @@ const [editPassword, setEditPassword] = useState("");
               <option value="admin">Admin (Full Control, Policies, Reconcile, User Management)</option>
             </select>
           </label>
+
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"
@@ -2911,7 +2974,146 @@ const [editPassword, setEditPassword] = useState("");
           </div>
         </form>
       </Modal>
-      
+
+      {/* User Created Success & Credential Delivery Modal */}
+      <Modal
+        title="User Account Created Successfully"
+        isOpen={createdResult !== null}
+        onClose={() => {
+          setCreatedResult(null);
+          setCopiedCredential(false);
+        }}
+      >
+        {createdResult && (
+          <div className="space-y-5">
+            <div className="flex items-center gap-3 rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4 text-emerald-300">
+              <CheckCircle2 size={24} className="shrink-0 text-emerald-400" />
+              <div className="text-sm">
+                <div className="font-semibold text-white">Account successfully provisioned</div>
+                <div className="text-xs text-emerald-200/80">User is active in control plane and permissions are applied.</div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 text-xs">
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-3">
+                <span className="text-slate-400 block mb-1">User ID</span>
+                <span className="font-mono font-semibold text-white">#{createdResult.id}</span>
+              </div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-3">
+                <span className="text-slate-400 block mb-1">Username</span>
+                <span className="font-mono font-semibold text-white">{createdResult.username}</span>
+              </div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-3">
+                <span className="text-slate-400 block mb-1">Assigned Role</span>
+                <span className="capitalize font-semibold text-cyan-400">{createdResult.role}</span>
+              </div>
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-3">
+                <span className="text-slate-400 block mb-1">Account Status</span>
+                <span className="inline-flex items-center gap-1.5 font-semibold text-emerald-400">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                  {createdResult.is_active ? "Active" : "Disabled"}
+                </span>
+              </div>
+            </div>
+
+            {/* Credential Delivery Details */}
+            <div className="space-y-2">
+              <span className="text-xs font-semibold text-slate-300 uppercase tracking-wider block">
+                {createdResult.credential_type === "initial_password" ? "Initial Temporary Password" : "Secure Setup / Invitation Link"}
+              </span>
+
+              {createdResult.credential_type === "initial_password" && createdResult.initial_password && (
+                <div>
+                  <div className="flex items-center justify-between rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 font-mono text-sm text-cyan-300">
+                    <span>{createdResult.initial_password}</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(createdResult.initial_password || "");
+                        setCopiedCredential(true);
+                        setTimeout(() => setCopiedCredential(false), 2000);
+                      }}
+                      className="flex items-center gap-1.5 rounded-lg bg-slate-800 px-2.5 py-1 text-xs text-slate-200 hover:bg-slate-700"
+                    >
+                      {copiedCredential ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
+                      {copiedCredential ? "Copied" : "Copy"}
+                    </button>
+                  </div>
+                  <p className="mt-1.5 text-xs text-amber-400/90 flex items-center gap-1">
+                    <AlertTriangle size={13} className="shrink-0" />
+                    Share this password securely with the user. It is never stored in plaintext and cannot be displayed again.
+                  </p>
+                </div>
+              )}
+
+              {createdResult.credential_type === "invitation_link" && createdResult.invitation_url && (
+                <div>
+                  <div className="flex items-center justify-between gap-2 rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 font-mono text-xs text-cyan-300 overflow-hidden">
+                    <span className="truncate">{createdResult.invitation_url}</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(createdResult.invitation_url || "");
+                        setCopiedCredential(true);
+                        setTimeout(() => setCopiedCredential(false), 2000);
+                      }}
+                      className="shrink-0 flex items-center gap-1.5 rounded-lg bg-slate-800 px-2.5 py-1 text-xs text-slate-200 hover:bg-slate-700"
+                    >
+                      {copiedCredential ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
+                      {copiedCredential ? "Copied" : "Copy Link"}
+                    </button>
+                  </div>
+                  <p className="mt-1.5 text-xs text-slate-400">
+                    This setup link is single-use, expires in 24 hours, and allows the user to set their password.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {/* Email Delivery Status */}
+            <div className="rounded-xl border border-slate-800 bg-slate-950 p-3.5 text-xs">
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-slate-400 font-medium">Email Delivery Notification</span>
+                {createdResult.email_delivery_status === "sent" && (
+                  <span className="rounded-md bg-emerald-500/20 px-2 py-0.5 font-medium text-emerald-400">
+                    Dispatched via SMTP
+                  </span>
+                )}
+                {createdResult.email_delivery_status === "not_configured" && (
+                  <span className="rounded-md bg-amber-500/20 px-2 py-0.5 font-medium text-amber-300">
+                    SMTP Not Configured
+                  </span>
+                )}
+                {createdResult.email_delivery_status === "failed" && (
+                  <span className="rounded-md bg-rose-500/20 px-2 py-0.5 font-medium text-rose-400">
+                    Delivery Failed
+                  </span>
+                )}
+                {createdResult.email_delivery_status === "none" && (
+                  <span className="rounded-md bg-slate-800 px-2 py-0.5 font-medium text-slate-400">
+                    Manual Handoff
+                  </span>
+                )}
+              </div>
+              <p className="text-slate-300">{createdResult.email_delivery_message}</p>
+            </div>
+
+            <div className="flex justify-end pt-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setCreatedResult(null);
+                  setCopiedCredential(false);
+                }}
+                className="rounded-xl bg-cyan-500 px-5 py-2.5 text-sm font-semibold text-slate-950 hover:bg-cyan-400"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
 {/* Edit User Modal */}
 <Modal
   title={`Edit User${editingUser ? `: ${editingUser.username}` : ""}`}
@@ -3863,6 +4065,8 @@ function TermsPage() {
         <p>You agree not to dispatch malicious tasks, circumvent concurrency policies, or attempt unauthorized principal escalation.</p>
         <h2 className="text-lg font-semibold text-white">3. API Key Security</h2>
         <p>You are solely responsible for guarding generated API keys and secrets against unauthorized disclosure.</p>
+        <h2 className="text-lg font-semibold text-white">4. Contact & Inquiries</h2>
+        <p>For inquiries regarding enterprise terms or support, contact <a href="mailto:support@flowforge.dev" className="text-cyan-400 hover:underline font-medium">support@flowforge.dev</a>.</p>
       </div>
       <div className="pt-4">
         <a href="/" className="inline-flex items-center gap-1.5 text-xs font-semibold text-cyan-400 hover:underline">
@@ -3888,6 +4092,8 @@ function PrivacyPage() {
         <p>All passwords are encrypted with PBKDF2-HMAC-SHA256 with cryptographically random salts. Tokens are securely hashed.</p>
         <h2 className="text-lg font-semibold text-white">3. Data Retention & Deletion</h2>
         <p>You may permanently purge your user profile and active API keys at any time via Account Settings.</p>
+        <h2 className="text-lg font-semibold text-white">4. Privacy Contact</h2>
+        <p>For data privacy inquiries or compliance verification, contact <a href="mailto:privacy@flowforge.dev" className="text-cyan-400 hover:underline font-medium">privacy@flowforge.dev</a>.</p>
       </div>
       <div className="pt-4">
         <a href="/" className="inline-flex items-center gap-1.5 text-xs font-semibold text-cyan-400 hover:underline">

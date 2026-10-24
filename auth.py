@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models import User, PasswordResetToken, EmailVerificationToken, ApiKey
 from config import safe_int
-from email_service import send_password_reset_email, send_verification_email
+from email_service import send_password_reset_email, send_verification_email, send_invitation_email, is_smtp_configured
 
 # ---------------------------------------------------------------------------
 # Configuration & Constants
@@ -99,9 +99,19 @@ class UserResponse(BaseModel):
 
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=1, max_length=100)
-    password: str = Field(..., min_length=12, max_length=128)
+    password: Optional[str] = Field(default=None, min_length=12, max_length=128)
     email: Optional[str] = None
     role: str = ROLE_OBSERVER
+    delivery_method: Optional[str] = "manual_password"
+
+
+class UserCreatedResponse(UserResponse):
+    credential_type: str = "initial_password"
+    initial_password: Optional[str] = None
+    invitation_url: Optional[str] = None
+    invitation_token: Optional[str] = None
+    email_delivery_status: str = "none"
+    email_delivery_message: str = ""
 
 
 class UserUpdate(BaseModel):
@@ -347,7 +357,7 @@ async def list_users(session: AsyncSession) -> list[User]:
 async def create_user(
     session: AsyncSession,
     username: str,
-    password: str,
+    password: Optional[str] = None,
     role: str = ROLE_OBSERVER,
     email: Optional[str] = None,
     is_active: bool = True,
@@ -375,10 +385,11 @@ async def create_user(
         if existing_email is not None:
             raise UserAlreadyExistsError(f"Email '{clean_email}' is already registered")
 
+    raw_password = password if (password and len(password) > 0) else secrets.token_urlsafe(32)
     user = User(
         username=clean_username,
         email=clean_email,
-        password_hash=hash_password(password),
+        password_hash=hash_password(raw_password),
         role=clean_role,
         is_active=is_active,
     )
@@ -529,12 +540,18 @@ async def request_password_reset(
 
     recipient_email = user.email or f"{user.username}@localhost"
     reset_url = f"{base_url.rstrip('/')}/reset-password?token={raw_token}"
-    send_password_reset_email(
-        to_email=recipient_email,
-        username=user.username,
-        reset_url=reset_url,
-        token=raw_token,
-    )
+    try:
+        send_password_reset_email(
+            to_email=recipient_email,
+            username=user.username,
+            reset_url=reset_url,
+            token=raw_token,
+        )
+    except Exception as exc:
+        import logging
+        logging.getLogger("flowforge.auth").error(
+            "Failed to dispatch password reset email to '%s': %s", recipient_email, exc
+        )
     return True
 
 
