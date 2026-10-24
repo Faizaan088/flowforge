@@ -156,7 +156,7 @@ def validate_production_configuration() -> None:
         )
     # Compose interpolates this value into DATABASE_URL; constrain it to URL-safe
     # characters so reserved characters cannot corrupt credentials in the URL.
-    postgres_password = os.getenv("POSTGRES_PASSWORD") or (parsed_db.password or "")
+    postgres_password = parsed_db.password or os.getenv("POSTGRES_PASSWORD") or ""
     if (
         len(postgres_password) < 24
         or not re.fullmatch(r"[A-Za-z0-9_-]+", postgres_password)

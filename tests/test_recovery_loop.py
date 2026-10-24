@@ -178,10 +178,14 @@ async def test_lifespan_starts_and_cancels_recovery_loop(monkeypatch):
     async def reconcile_queue(_session):
         return None
 
+    async def fake_bootstrap(_session):
+        return None
+
     monkeypatch.setattr(main, "engine", FakeEngine())
     monkeypatch.setattr(main, "AsyncSessionLocal", FakeSession)
     monkeypatch.setattr(main, "recovery_loop", recovery_loop)
     monkeypatch.setattr(main, "reconcile_queue", reconcile_queue)
+    monkeypatch.setattr(main, "bootstrap_admin", fake_bootstrap)
 
     async with main.lifespan(main.app):
         await asyncio.wait_for(started.wait(), timeout=1)
